@@ -14,8 +14,11 @@ use ratatui_image::{StatefulImage, picker::Picker, protocol::StatefulProtocol};
 
 use crate::error::{Errx, Resultx};
 
+const SCROLL_JUMP: usize = 8;
+const SCROLL_OFF: usize = 8;
+
 pub fn run_navigator(terminal: &mut DefaultTerminal) -> Resultx<()> {
-    use crossterm::event::KeyCode;
+    use crossterm::event::{KeyCode, KeyModifiers};
 
     let mut navigator = Navigator::new(".")?;
     loop {
@@ -25,9 +28,16 @@ pub fn run_navigator(terminal: &mut DefaultTerminal) -> Resultx<()> {
 
         let event = crossterm::event::read()?;
         if let Some(key_event) = event.as_key_event() {
+            let ctrl = key_event.modifiers.contains(KeyModifiers::CONTROL);
             match key_event.code {
                 KeyCode::Char('q') => {
                     break Ok(());
+                }
+                KeyCode::Char('d') if ctrl => {
+                    navigator.move_down_by(SCROLL_JUMP);
+                }
+                KeyCode::Char('u') if ctrl => {
+                    navigator.move_up_by(SCROLL_JUMP);
                 }
                 KeyCode::Char('j') | KeyCode::Down => {
                     navigator.move_down();
@@ -51,6 +61,7 @@ pub struct Navigator {
     current_directory: PathBuf,
     entries: Vec<DirEntry>,
     selected: usize,
+    scroll_offset: usize,
     picker: Picker,
     cached_image: Option<(PathBuf, StatefulProtocol)>,
 }
@@ -69,6 +80,7 @@ impl Navigator {
             current_directory,
             entries,
             selected: 0,
+            scroll_offset: 0,
             picker,
             cached_image: None,
         })
@@ -86,6 +98,7 @@ impl Navigator {
             self.current_directory = new_path;
             self.entries = entries;
             self.selected = 0;
+            self.scroll_offset = 0;
             self.cached_image = None;
         }
 
@@ -98,19 +111,28 @@ impl Navigator {
             self.current_directory = parent.to_path_buf();
             self.entries = entries;
             self.selected = 0;
+            self.scroll_offset = 0;
             self.cached_image = None;
         }
         Ok(())
     }
 
     pub fn move_up(&mut self) {
-        self.selected = self.selected.saturating_sub(1);
-        self.cached_image = None;
+        self.move_up_by(1);
     }
 
     pub fn move_down(&mut self) {
+        self.move_down_by(1);
+    }
+
+    pub fn move_up_by(&mut self, n: usize) {
+        self.selected = self.selected.saturating_sub(n);
+        self.cached_image = None;
+    }
+
+    pub fn move_down_by(&mut self, n: usize) {
         if !self.entries.is_empty() {
-            self.selected = (self.selected + 1).min(self.entries.len() - 1);
+            self.selected = (self.selected + n).min(self.entries.len() - 1);
             self.cached_image = None;
         }
     }
@@ -129,7 +151,7 @@ impl Navigator {
         self.render_preview(chunks[1], buf);
     }
 
-    fn render_file_list(&self, area: Rect, buf: &mut Buffer) {
+    fn render_file_list(&mut self, area: Rect, buf: &mut Buffer) {
         let block = Block::default()
             .borders(Borders::RIGHT)
             .title(format!(" {} ", self.current_directory.display()));
@@ -137,10 +159,24 @@ impl Navigator {
         let inner = block.inner(area);
         block.render(area, buf);
 
-        for (i, entry) in self.entries.iter().enumerate() {
-            if i as u16 >= inner.height {
-                break;
-            }
+        let visible_height = inner.height as usize;
+        let scrolloff = SCROLL_OFF.min(visible_height / 2);
+
+        // Adjust scroll offset to keep selection visible with scrolloff context
+        if self.selected < self.scroll_offset + scrolloff {
+            self.scroll_offset = self.selected.saturating_sub(scrolloff);
+        } else if self.selected + scrolloff >= self.scroll_offset + visible_height {
+            self.scroll_offset = (self.selected + scrolloff + 1).saturating_sub(visible_height);
+        }
+
+        for (i, entry) in self
+            .entries
+            .iter()
+            .enumerate()
+            .skip(self.scroll_offset)
+            .take(visible_height)
+        {
+            let y = (i - self.scroll_offset) as i32;
             let prefix = if entry.is_dir { "📁 " } else { "   " };
             let style = if i == self.selected {
                 Style::new().reversed()
@@ -148,10 +184,7 @@ impl Navigator {
                 Style::default()
             };
             let line = Line::styled(format!("{}{}", prefix, entry.name), style);
-            line.render(
-                inner.offset(ratatui::layout::Offset { x: 0, y: i as i32 }),
-                buf,
-            );
+            line.render(inner.offset(ratatui::layout::Offset { x: 0, y }), buf);
         }
     }
 
