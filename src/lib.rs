@@ -9,7 +9,7 @@ use crate::error::Resultx;
 pub fn run_navigator(terminal: &mut DefaultTerminal) -> Resultx<()> {
     use crossterm::event::KeyCode;
 
-    let mut navigator = Navigator::new()?;
+    let mut navigator = Navigator::new(".")?;
     loop {
         terminal.draw(|frame| {
             frame.render_widget(&navigator, frame.area());
@@ -18,9 +18,21 @@ pub fn run_navigator(terminal: &mut DefaultTerminal) -> Resultx<()> {
         let event = crossterm::event::read()?;
         if let Some(key_event) = event.as_key_event() {
             match key_event.code {
-                KeyCode::Char('q') => break Ok(()),
-                KeyCode::Char('j') | KeyCode::Down => navigator.move_down(),
-                KeyCode::Char('k') | KeyCode::Up => navigator.move_up(),
+                KeyCode::Char('q') => {
+                    break Ok(());
+                }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    navigator.move_down();
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    navigator.move_up();
+                }
+                KeyCode::Enter => {
+                    navigator.enter_selected_directory()?;
+                }
+                KeyCode::Char('-') => {
+                    navigator.go_to_parent_directory()?;
+                }
                 _ => {}
             }
         }
@@ -39,9 +51,9 @@ pub struct DirEntry {
 }
 
 impl Navigator {
-    pub fn new() -> Resultx<Self> {
-        let current_directory = PathBuf::from(".");
-        let entries = Self::read_dir(&current_directory)?;
+    pub fn new(current_directory_path: &str) -> Resultx<Self> {
+        let current_directory = PathBuf::from(current_directory_path);
+        let entries = read_dir(&current_directory)?;
         Ok(Self {
             current_directory,
             entries,
@@ -49,22 +61,35 @@ impl Navigator {
         })
     }
 
-    fn read_dir(path: &PathBuf) -> Resultx<Vec<DirEntry>> {
-        let mut entries: Vec<DirEntry> = fs::read_dir(path)?
-            .filter_map(|e| e.ok())
-            .map(|e| DirEntry {
-                name: e.file_name().to_string_lossy().into_owned(),
-                is_dir: e.file_type().map(|t| t.is_dir()).unwrap_or(false),
-            })
-            .collect();
+    pub fn enter_selected_directory(&mut self) -> Resultx<()> {
+        if self.entries.is_empty() {
+            return Ok(());
+        }
 
-        entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => a.name.cmp(&b.name),
-        });
+        let selected_entry = &self.entries[self.selected];
+        if selected_entry.is_dir {
+            let new_path = self.current_directory.join(&selected_entry.name);
+            let entries = read_dir(&new_path)?;
+            self.current_directory = new_path;
+            self.entries = entries;
+            self.selected = 0;
+        } else {
+            eprintln!("'{}' is not a directory.", selected_entry.name);
+        }
 
-        Ok(entries)
+        Ok(())
+    }
+
+    pub fn go_to_parent_directory(&mut self) -> Resultx<()> {
+        if let Some(parent) = self.current_directory.parent() {
+            let entries = read_dir(&parent.to_path_buf())?;
+            self.current_directory = parent.to_path_buf();
+            self.entries = entries;
+            self.selected = 0;
+        } else {
+            eprintln!("Already at the root directory.");
+        }
+        Ok(())
     }
 
     pub fn move_up(&mut self) {
@@ -103,4 +128,35 @@ impl Widget for &Navigator {
             );
         }
     }
+}
+
+fn read_dir(path: &PathBuf) -> Resultx<Vec<DirEntry>> {
+    let mut entries: Vec<DirEntry> = fs::read_dir(path)?
+        .filter_map(|e| e.ok())
+        .map(|e| DirEntry {
+            name: e.file_name().to_string_lossy().into_owned(),
+            is_dir: e.file_type().map(|t| t.is_dir()).unwrap_or(false),
+        })
+        .collect();
+
+    entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => a.name.cmp(&b.name),
+    });
+
+    let all = [
+        DirEntry {
+            name: ".".to_string(),
+            is_dir: true,
+        },
+        DirEntry {
+            name: "..".to_string(),
+            is_dir: true,
+        },
+    ]
+    .into_iter()
+    .chain(entries.into_iter());
+
+    Ok(all.collect())
 }
