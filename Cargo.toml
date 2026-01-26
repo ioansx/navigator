@@ -12,4 +12,7 @@ strip = true
 [dependencies]
 clap = "4.5.54"
 crossterm = "0.29.0"
+image = "0.25"
 ratatui = "0.30.0"
+resvg = "0.45"
+ratatui-image = { version = "10.0", default-features = false, features = ["image-defaults", "crossterm"] }
