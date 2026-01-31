@@ -14,6 +14,18 @@ const UNLOCK_MSG: &str = "LOG_STORE lock should not be poisoned";
 
 pub static LOG_STORE: OnceLock<LogStore> = OnceLock::new();
 
+pub fn init_logger(rust_log: Option<String>) -> Resultx<()> {
+    let level_filter = rust_log
+        .and_then(|x| log::LevelFilter::from_str(&x).ok())
+        .unwrap_or(log::LevelFilter::Info);
+
+    let store = LOG_STORE.get_or_init(LogStore::new);
+    log::set_logger(store).map_err(|e| Errx::e_any(e, "failed to initialize logging"))?;
+    log::set_max_level(level_filter);
+
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct LogEntry {
     pub level: Level,
@@ -87,16 +99,4 @@ impl Log for LogStore {
     }
 
     fn flush(&self) {}
-}
-
-pub fn init_logger(rust_log: Option<String>) -> Resultx<()> {
-    let level_filter = rust_log
-        .and_then(|x| log::LevelFilter::from_str(&x).ok())
-        .unwrap_or(log::LevelFilter::Info);
-
-    let store = LOG_STORE.get_or_init(LogStore::new);
-    log::set_logger(store).map_err(|e| Errx::e_any(e, "failed to initialize logging"))?;
-    log::set_max_level(level_filter);
-
-    Ok(())
 }
