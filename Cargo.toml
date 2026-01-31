@@ -3,6 +3,10 @@ name = "navigator"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "nav"
+path = "src/main.rs"
+
 [profile.release]
 codegen-units = 1
 lto = true
