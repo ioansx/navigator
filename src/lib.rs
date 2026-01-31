@@ -1,4 +1,5 @@
 pub mod error;
+pub mod logging;
 
 mod globals;
 mod io;
@@ -11,10 +12,13 @@ use crate::{error::Resultx, globals::SCROLL_JUMP, navigator::Navigator};
 pub fn run_navigator(terminal: &mut DefaultTerminal) -> Resultx<()> {
     use crossterm::event::{KeyCode, KeyModifiers};
 
+    logging::init_logger().ok();
+    log::info!("Navigator started");
+
     let mut navigator = Navigator::new(".")?;
     loop {
         terminal.draw(|frame| {
-            navigator.render_with_preview(frame.area(), frame.buffer_mut());
+            navigator.render(frame.area(), frame.buffer_mut());
         })?;
 
         let event = crossterm::event::read()?;
@@ -23,7 +27,8 @@ pub fn run_navigator(terminal: &mut DefaultTerminal) -> Resultx<()> {
 
             match key_event.code {
                 KeyCode::Char('q') => {
-                    break Ok(());
+                    log::info!("Navigator quit");
+                    return Ok(());
                 }
                 KeyCode::Char('d') if ctrl => {
                     navigator.move_down_by(SCROLL_JUMP);
@@ -42,6 +47,9 @@ pub fn run_navigator(terminal: &mut DefaultTerminal) -> Resultx<()> {
                 }
                 KeyCode::Char('-') => {
                     navigator.go_to_parent_directory()?;
+                }
+                KeyCode::Char('L') => {
+                    navigator.toggle_log_panel();
                 }
                 _ => {}
             }

@@ -8,8 +8,12 @@ pub struct DirEntry {
 }
 
 pub fn read_dir(path: &PathBuf) -> Resultx<Vec<DirEntry>> {
+    log::debug!("Reading directory: {}", path.display());
     let mut entries: Vec<DirEntry> = std::fs::read_dir(path)
-        .map_err(|e| Errx::e_io(e, format!("reading {}", path.display())))?
+        .map_err(|e| {
+            log::error!("Failed to read directory {}: {}", path.display(), e);
+            Errx::e_io(e, format!("reading {}", path.display()))
+        })?
         // TODO: do not ignore these errors
         .filter_map(|e| e.ok())
         .map(|e| DirEntry {

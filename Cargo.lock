@@ -1248,6 +1248,7 @@ dependencies = [
  "clap",
  "crossterm",
  "image",
+ "log",
  "ratatui",
  "ratatui-image",
  "resvg",

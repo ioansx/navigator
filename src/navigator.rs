@@ -3,8 +3,8 @@ use std::{fs, io::Read, path::PathBuf};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     prelude::Buffer,
-    style::Style,
-    text::Line,
+    style::{Color, Style},
+    text::{Line, Span},
     widgets::{Block, Borders, Paragraph, StatefulWidget, Widget},
 };
 use ratatui_image::{StatefulImage, picker::Picker, protocol::StatefulProtocol};
@@ -13,6 +13,7 @@ use crate::{
     error::Resultx,
     globals::SCROLL_OFF,
     io::dir::{DirEntry, read_dir},
+    logging::{LOG_STORE, LogLevel},
 };
 
 pub struct Navigator {
@@ -22,6 +23,8 @@ pub struct Navigator {
     scroll_offset: usize,
     picker: Picker,
     cached_image: Option<(PathBuf, StatefulProtocol)>,
+    log_panel_visible: bool,
+    log_scroll_offset: usize,
 }
 
 impl Navigator {
@@ -42,6 +45,8 @@ impl Navigator {
             scroll_offset: 0,
             picker,
             cached_image: None,
+            log_panel_visible: false,
+            log_scroll_offset: 0,
         })
     }
 
@@ -53,6 +58,8 @@ impl Navigator {
         let selected_entry = &self.entries[self.selected];
         if selected_entry.is_dir {
             let new_path = self.current_dir.join(&selected_entry.name);
+
+            log::info!("Entering directory: {}", new_path.display());
 
             // FS
             let entries = read_dir(&new_path)?;
@@ -74,6 +81,8 @@ impl Navigator {
                 return Ok(());
             }
 
+            log::info!("Going to parent: {}", parent.display());
+
             let entries = read_dir(&parent.to_path_buf())?;
             self.current_dir = parent.to_path_buf();
             self.entries = entries;
@@ -93,15 +102,32 @@ impl Navigator {
     }
 
     pub fn move_up_by(&mut self, n: usize) {
-        self.selected = self.selected.saturating_sub(n);
-        self.cached_image = None;
+        if self.log_panel_visible {
+            // Scroll up in log panel (showing older entries)
+            if let Some(store) = LOG_STORE.get() {
+                let total = store.entries().len();
+                // Since we render from bottom, "up" means scroll to see older (earlier in list)
+                self.log_scroll_offset = (self.log_scroll_offset + n).min(total.saturating_sub(1));
+            }
+        } else {
+            self.selected = self.selected.saturating_sub(n);
+            self.cached_image = None;
+        }
     }
 
     pub fn move_down_by(&mut self, n: usize) {
-        if !self.entries.is_empty() {
+        if self.log_panel_visible {
+            // Scroll down in log panel (showing newer entries)
+            self.log_scroll_offset = self.log_scroll_offset.saturating_sub(n);
+        } else if !self.entries.is_empty() {
             self.selected = (self.selected + n).min(self.entries.len() - 1);
             self.cached_image = None;
         }
+    }
+
+    pub fn toggle_log_panel(&mut self) {
+        self.log_panel_visible = !self.log_panel_visible;
+        self.log_scroll_offset = 0;
     }
 
     fn selected_path(&self) -> Option<PathBuf> {
@@ -110,7 +136,24 @@ impl Navigator {
             .map(|e| self.current_dir.join(&e.name))
     }
 
-    pub fn render_with_preview(&mut self, area: Rect, buf: &mut Buffer) {
+    pub fn render(&mut self, area: Rect, buf: &mut Buffer) {
+        if self.log_panel_visible {
+            // Expanded: file list on top, log panel takes bottom 70%
+            let chunks = Layout::vertical([Constraint::Percentage(30), Constraint::Percentage(70)])
+                .split(area);
+
+            self.render_file_list(chunks[0], buf);
+            self.render_log_panel(chunks[1], buf);
+        } else {
+            // Collapsed: file list + preview on top, status line at bottom
+            let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).split(area);
+
+            self.render_with_preview(chunks[0], buf);
+            self.render_status_line(chunks[1], buf);
+        }
+    }
+
+    fn render_with_preview(&mut self, area: Rect, buf: &mut Buffer) {
         let chunks = Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)])
             .split(area);
 
@@ -248,6 +291,101 @@ impl Navigator {
     fn render_text_preview(&self, path: &PathBuf, area: Rect, buf: &mut Buffer) {
         let content = read_file_preview(path, area.height as usize);
         Paragraph::new(content).render(area, buf);
+    }
+
+    fn render_status_line(&self, area: Rect, buf: &mut Buffer) {
+        let Some(store) = LOG_STORE.get() else {
+            return;
+        };
+
+        let Some(entry) = store.latest() else {
+            return;
+        };
+
+        let elapsed = store.time_since_start() - store.elapsed_since(&entry);
+        let elapsed_secs = elapsed.as_secs();
+        let time_str = if elapsed_secs < 60 {
+            format!("({}s)", elapsed_secs)
+        } else {
+            format!("({}m)", elapsed_secs / 60)
+        };
+
+        let level_color = match entry.level {
+            LogLevel::Error => Color::Red,
+            LogLevel::Warn => Color::Yellow,
+            LogLevel::Info => Color::Green,
+            LogLevel::Debug => Color::Blue,
+            LogLevel::Trace => Color::Gray,
+        };
+
+        let block = Block::default().borders(Borders::TOP);
+        let inner = block.inner(area);
+        block.render(area, buf);
+
+        let line = Line::from(vec![
+            Span::styled(
+                format!("[{}]", entry.level.as_str()),
+                Style::default().fg(level_color),
+            ),
+            Span::raw(" "),
+            Span::raw(&entry.message),
+            Span::raw(" "),
+            Span::styled(time_str, Style::default().fg(Color::DarkGray)),
+        ]);
+
+        line.render(inner, buf);
+    }
+
+    fn render_log_panel(&mut self, area: Rect, buf: &mut Buffer) {
+        let block = Block::default().borders(Borders::TOP);
+        let inner = block.inner(area);
+        block.render(area, buf);
+
+        let Some(store) = LOG_STORE.get() else {
+            return;
+        };
+
+        let entries = store.entries();
+        let visible_height = inner.height as usize;
+        let total_entries = entries.len();
+
+        // Adjust scroll to keep within bounds
+        if total_entries > visible_height {
+            let max_offset = total_entries.saturating_sub(visible_height);
+            self.log_scroll_offset = self.log_scroll_offset.min(max_offset);
+        } else {
+            self.log_scroll_offset = 0;
+        }
+
+        // Render from bottom (newest at bottom)
+        for (i, entry) in entries
+            .iter()
+            .rev()
+            .skip(self.log_scroll_offset)
+            .take(visible_height)
+            .enumerate()
+        {
+            let y = (visible_height - 1 - i) as i32;
+
+            let level_color = match entry.level {
+                LogLevel::Error => Color::Red,
+                LogLevel::Warn => Color::Yellow,
+                LogLevel::Info => Color::Green,
+                LogLevel::Debug => Color::Blue,
+                LogLevel::Trace => Color::Gray,
+            };
+
+            let line = Line::from(vec![
+                Span::styled(
+                    format!("[{}]", entry.level.as_str()),
+                    Style::default().fg(level_color),
+                ),
+                Span::raw(" "),
+                Span::raw(&entry.message),
+            ]);
+
+            line.render(inner.offset(ratatui::layout::Offset { x: 0, y }), buf);
+        }
     }
 }
 
