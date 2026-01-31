@@ -1,4 +1,5 @@
 pub mod error;
+pub mod log_store;
 pub mod logging;
 
 mod globals;

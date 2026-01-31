@@ -1,5 +1,6 @@
 use std::{fs, io::Read, path::PathBuf};
 
+use log::Level;
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     prelude::Buffer,
@@ -13,7 +14,7 @@ use crate::{
     error::Resultx,
     globals::SCROLL_OFF,
     io::dir::{DirEntry, read_dir},
-    logging::{LOG_STORE, LogLevel},
+    log_store::LOG_STORE,
 };
 
 pub struct Navigator {
@@ -105,8 +106,8 @@ impl Navigator {
         if self.log_panel_visible {
             // Scroll up in log panel (showing older entries)
             if let Some(store) = LOG_STORE.get() {
-                let total = store.entries().len();
-                // Since we render from bottom, "up" means scroll to see older (earlier in list)
+                let total = store.len();
+                // Since we render from bottom, "up" means scroll to see older (earlier in list).
                 self.log_scroll_offset = (self.log_scroll_offset + n).min(total.saturating_sub(1));
             }
         } else {
@@ -311,11 +312,11 @@ impl Navigator {
         };
 
         let level_color = match entry.level {
-            LogLevel::Error => Color::Red,
-            LogLevel::Warn => Color::Yellow,
-            LogLevel::Info => Color::Green,
-            LogLevel::Debug => Color::Blue,
-            LogLevel::Trace => Color::Gray,
+            Level::Error => Color::Red,
+            Level::Warn => Color::Yellow,
+            Level::Info => Color::Green,
+            Level::Debug => Color::Blue,
+            Level::Trace => Color::Gray,
         };
 
         let block = Block::default().borders(Borders::TOP);
@@ -368,11 +369,11 @@ impl Navigator {
             let y = (visible_height - 1 - i) as i32;
 
             let level_color = match entry.level {
-                LogLevel::Error => Color::Red,
-                LogLevel::Warn => Color::Yellow,
-                LogLevel::Info => Color::Green,
-                LogLevel::Debug => Color::Blue,
-                LogLevel::Trace => Color::Gray,
+                Level::Error => Color::Red,
+                Level::Warn => Color::Yellow,
+                Level::Info => Color::Green,
+                Level::Debug => Color::Blue,
+                Level::Trace => Color::Gray,
             };
 
             let line = Line::from(vec![
