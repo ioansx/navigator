@@ -4,6 +4,7 @@ pub mod log_store;
 mod globals;
 mod io;
 mod navigator;
+mod preview;
 
 use ratatui::DefaultTerminal;
 

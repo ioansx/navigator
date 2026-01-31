@@ -15,6 +15,7 @@ use crate::{
     globals::SCROLL_OFF,
     io::dir::{DirEntry, read_dir},
     log_store::LOG_STORE,
+    preview::{image_preview, svg_preview},
 };
 
 pub struct Navigator {
@@ -210,9 +211,9 @@ impl Navigator {
 
         if entry.is_dir {
             self.render_directory_preview(&path, area, buf);
-        } else if is_svg(&path) {
+        } else if svg_preview::is_svg(&path) {
             self.render_svg_preview(&path, area, buf);
-        } else if is_image(&path) {
+        } else if image_preview::is_image(&path) {
             self.render_image_preview(&path, area, buf);
         } else {
             self.render_text_preview(&path, area, buf);
@@ -254,7 +255,7 @@ impl Navigator {
         };
 
         if needs_reload {
-            if let Some(dyn_img) = rasterize_svg(path) {
+            if let Some(dyn_img) = svg_preview::rasterize_svg(path) {
                 let protocol = self.picker.new_resize_protocol(dyn_img);
                 self.cached_image = Some((path.clone(), protocol));
             } else {
@@ -390,31 +391,6 @@ impl Navigator {
     }
 }
 
-fn is_svg(path: &PathBuf) -> bool {
-    path.extension()
-        .is_some_and(|ext| ext.to_string_lossy().eq_ignore_ascii_case("svg"))
-}
-
-fn rasterize_svg(path: &PathBuf) -> Option<image::DynamicImage> {
-    let tree = resvg::usvg::Tree::from_data(&fs::read(path).ok()?, &Default::default()).ok()?;
-    let size = tree.size().to_int_size();
-    let mut pixmap = resvg::tiny_skia::Pixmap::new(size.width(), size.height())?;
-    resvg::render(&tree, Default::default(), &mut pixmap.as_mut());
-    let img = image::RgbaImage::from_raw(size.width(), size.height(), pixmap.take())?;
-    Some(image::DynamicImage::ImageRgba8(img))
-}
-
-fn is_image(path: &PathBuf) -> bool {
-    let Some(ext) = path.extension() else {
-        return false;
-    };
-    let ext = ext.to_string_lossy().to_lowercase();
-    matches!(
-        ext.as_str(),
-        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "ico" | "tiff" | "tif"
-    )
-}
-
 fn read_file_preview(path: &PathBuf, max_lines: usize) -> String {
     let Ok(mut file) = fs::File::open(path) else {
         return "(cannot read file)".to_string();
@@ -429,8 +405,8 @@ fn read_file_preview(path: &PathBuf, max_lines: usize) -> String {
     buffer.truncate(bytes_read);
 
     // Check if content appears to be binary
-    let null_count = buffer.iter().filter(|&&b| b == 0).count();
-    if null_count > 0 || buffer.iter().any(|&b| b < 0x09 && b != 0x00) {
+    let null_count = buffer.iter().filter(|b| **b == 0).count();
+    if null_count > 0 || buffer.iter().any(|b| *b < 0x09 && *b != 0x00) {
         return "(binary file)".to_string();
     }
 
