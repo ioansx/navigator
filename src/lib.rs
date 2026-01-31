@@ -12,7 +12,6 @@ use crate::{error::Resultx, globals::SCROLL_JUMP, navigator::Navigator};
 pub fn run_navigator(terminal: &mut DefaultTerminal) -> Resultx<()> {
     use crossterm::event::{KeyCode, KeyModifiers};
 
-    logging::init_logger().ok();
     log::info!("Navigator started");
 
     let mut navigator = Navigator::new(".")?;

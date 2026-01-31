@@ -1,2 +1,4 @@
 mod store;
-pub use store::{init_logger, LogEntry, LogLevel, LOG_STORE};
+
+pub use log::Level as LogLevel;
+pub use store::{LOG_STORE, LogEntry, init_logger};

@@ -1,9 +1,13 @@
 use navigator::{
     error::{Kindx, Resultx},
-    run_navigator,
+    logging, run_navigator,
 };
 
 fn main() -> Resultx<()> {
-    ratatui::run(run_navigator).map_err(|e| e.ctx(Kindx::any("nav failed")))?;
+    let rust_log = std::env::var("RUST_LOG").ok();
+
+    logging::init_logger(rust_log)?;
+    ratatui::run(run_navigator)
+        .map_err(|e| e.ctx(Kindx::any("nav encountered an internal error")))?;
     Ok(())
 }
