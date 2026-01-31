@@ -10,9 +10,12 @@ opt-level = 3
 strip = true
 
 [dependencies]
-clap = "4.5.54"
+clap = "4.5.56"
 crossterm = "0.29.0"
-image = "0.25"
+image = "0.25.9"
 ratatui = "0.30.0"
-resvg = "0.45"
-ratatui-image = { version = "10.0", default-features = false, features = ["image-defaults", "crossterm"] }
+resvg = "0.46.0"
+ratatui-image = { version = "10.0.4", default-features = false, features = [
+	"image-defaults",
+	"crossterm",
+] }
