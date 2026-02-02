@@ -12,7 +12,7 @@ use ratatui_image::{StatefulImage, picker::Picker, protocol::StatefulProtocol};
 
 use crate::{
     error::Resultx,
-    globals::{NF_OCT_FILE_DIRECTORY_FILL, SCROLL_OFF},
+    globals::{file_color, NF_FILE, NF_OCT_FILE_DIRECTORY_FILL, SCROLL_OFF},
     io::dir::{DirEntry, read_dir},
     log_store::LOG_STORE,
     preview::{image_preview, svg_preview},
@@ -251,17 +251,14 @@ impl Navigator {
             .take(visible_height)
         {
             let y = (i - self.scroll_offset) as i32;
-            let prefix = if entry.is_dir {
-                &format!("{NF_OCT_FILE_DIRECTORY_FILL}  ")
-            } else {
-                "   "
-            };
+            let icon = if entry.is_dir { NF_OCT_FILE_DIRECTORY_FILL } else { NF_FILE };
+            let color = file_color(&entry.name, entry.is_dir);
             let style = if i == self.selected {
-                Style::new().reversed()
+                Style::new().fg(color).reversed()
             } else {
-                Style::default()
+                Style::new().fg(color)
             };
-            let line = Line::styled(format!("{}{}", prefix, entry.name), style);
+            let line = Line::styled(format!("{}  {}", icon, entry.name), style);
             line.render(inner.offset(ratatui::layout::Offset { x: 0, y }), buf);
         }
     }
@@ -298,7 +295,7 @@ impl Navigator {
                         if is_dir {
                             format!("{NF_OCT_FILE_DIRECTORY_FILL}  {}", name)
                         } else {
-                            format!("   {}", name)
+                            format!("{NF_FILE}  {}", name)
                         }
                     })
                     .collect();
