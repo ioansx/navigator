@@ -6,16 +6,29 @@ mod io;
 mod navigator;
 mod preview;
 
+use clap::Parser;
 use ratatui::DefaultTerminal;
 
 use crate::{error::Resultx, globals::SCROLL_JUMP, navigator::Navigator};
 
-pub fn run_navigator(terminal: &mut DefaultTerminal) -> Resultx<()> {
+#[derive(Parser, Debug)]
+#[command(name = "nav", about = "Terminal file navigator")]
+pub struct Args {
+    /// Directory to open
+    #[arg(default_value = ".")]
+    pub path: String,
+
+    /// File to select
+    #[arg(short, long)]
+    pub select: Option<String>,
+}
+
+pub fn run_navigator(terminal: &mut DefaultTerminal, args: &Args) -> Resultx<()> {
     use crossterm::event::{KeyCode, KeyModifiers};
 
-    log::info!("Navigator started");
+    log::info!("Navigator started in: {}", args.path);
 
-    let mut navigator = Navigator::new(".")?;
+    let mut navigator = Navigator::new(&args.path, args.select.as_deref())?;
     loop {
         terminal.draw(|frame| {
             navigator.render(frame.area(), frame.buffer_mut());
@@ -43,7 +56,9 @@ pub fn run_navigator(terminal: &mut DefaultTerminal) -> Resultx<()> {
                     navigator.move_up();
                 }
                 KeyCode::Enter => {
-                    navigator.enter_selected_directory()?;
+                    if navigator.enter_selected()? {
+                        return Ok(()); // File opened in neovim, quit navigator
+                    }
                 }
                 KeyCode::Char('-') => {
                     navigator.go_to_parent_directory()?;

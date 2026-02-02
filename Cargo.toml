@@ -14,7 +14,7 @@ opt-level = 3
 strip = true
 
 [dependencies]
-clap = "4.5.56"
+clap = { version = "4.5.56", features = ["derive"] }
 log = "0.4"
 crossterm = "0.29.0"
 image = "0.25.9"

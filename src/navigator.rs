@@ -1,4 +1,4 @@
-use std::{fs, io::Read, path::PathBuf};
+use std::{env, fs, io::Read, path::PathBuf, process::Command};
 
 use log::Level;
 use ratatui::{
@@ -12,7 +12,7 @@ use ratatui_image::{StatefulImage, picker::Picker, protocol::StatefulProtocol};
 
 use crate::{
     error::Resultx,
-    globals::SCROLL_OFF,
+    globals::{NF_OCT_FILE_DIRECTORY_FILL, SCROLL_OFF},
     io::dir::{DirEntry, read_dir},
     log_store::LOG_STORE,
     preview::{image_preview, svg_preview},
@@ -30,7 +30,7 @@ pub struct Navigator {
 }
 
 impl Navigator {
-    pub fn new(current_dir_path: &str) -> Resultx<Self> {
+    pub fn new(current_dir_path: &str, select: Option<&str>) -> Resultx<Self> {
         let mut current_dir = PathBuf::from(current_dir_path);
         // Calling `parent()` on a relative path returns None, so work with canonical paths.
         if current_dir.is_relative() {
@@ -40,10 +40,15 @@ impl Navigator {
         let entries = read_dir(&current_dir)?;
         let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
 
+        // Find the index of the file to select
+        let selected = select
+            .and_then(|name| entries.iter().position(|e| e.name == name))
+            .unwrap_or(0);
+
         Ok(Self {
             current_dir,
             entries,
-            selected: 0,
+            selected,
             scroll_offset: 0,
             picker,
             cached_image: None,
@@ -52,9 +57,10 @@ impl Navigator {
         })
     }
 
-    pub fn enter_selected_directory(&mut self) -> Resultx<()> {
+    /// Returns `Ok(true)` if the navigator should quit (file opened in neovim).
+    pub fn enter_selected(&mut self) -> Resultx<bool> {
         if self.entries.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
 
         let selected_entry = &self.entries[self.selected];
@@ -63,7 +69,6 @@ impl Navigator {
 
             log::info!("Entering directory: {}", new_path.display());
 
-            // FS
             let entries = read_dir(&new_path)?;
 
             self.current_dir = new_path;
@@ -71,9 +76,66 @@ impl Navigator {
             self.selected = 0;
             self.scroll_offset = 0;
             self.cached_image = None;
+            Ok(false)
+        } else {
+            // File selected - open in neovim
+            let path = self.current_dir.join(&selected_entry.name);
+            self.open_in_neovim(&path)
+        }
+    }
+
+    /// Opens a file in the parent neovim instance via the NVIM socket.
+    /// Returns `Ok(true)` if successful and navigator should quit.
+    fn open_in_neovim(&self, path: &PathBuf) -> Resultx<bool> {
+        let nvim_socket = match env::var("NVIM") {
+            Ok(socket) => {
+                log::info!("NVIM socket: {}", socket);
+                socket
+            }
+            Err(e) => {
+                log::warn!(
+                    "NVIM env var not set: {} - not running inside neovim terminal",
+                    e
+                );
+                return Ok(false);
+            }
+        };
+
+        let path_str = path.to_str().unwrap_or("");
+        log::info!("Opening in neovim: {}", path_str);
+        log::info!("Running: nvim --server {} --remote-expr ...", nvim_socket);
+
+        // Use --remote-expr to:
+        // 1. Switch to the previous window (the one behind the floating terminal)
+        // 2. Open the file there
+        // This way when the floating terminal closes, the file is already visible.
+        let cmd = format!("execute('wincmd p | edit {}')", path_str.replace("'", "''"));
+        log::info!("Sending command: {}", cmd);
+
+        let output = Command::new("nvim")
+            .args(["--server", &nvim_socket, "--remote-expr", &cmd])
+            .output()?;
+
+        log::info!("Exit status: {:?}", output.status);
+
+        if !output.stdout.is_empty() {
+            log::info!("stdout: {}", String::from_utf8_lossy(&output.stdout));
         }
 
-        Ok(())
+        if !output.stderr.is_empty() {
+            log::error!("stderr: {}", String::from_utf8_lossy(&output.stderr));
+        }
+
+        if output.status.success() {
+            log::info!("File opened in neovim");
+            Ok(true)
+        } else {
+            log::error!(
+                "Failed to open file in neovim (exit code: {:?})",
+                output.status.code()
+            );
+            Ok(false)
+        }
     }
 
     pub fn go_to_parent_directory(&mut self) -> Resultx<()> {
@@ -189,7 +251,11 @@ impl Navigator {
             .take(visible_height)
         {
             let y = (i - self.scroll_offset) as i32;
-            let prefix = if entry.is_dir { "📁 " } else { "   " };
+            let prefix = if entry.is_dir {
+                &format!("{NF_OCT_FILE_DIRECTORY_FILL}  ")
+            } else {
+                "   "
+            };
             let style = if i == self.selected {
                 Style::new().reversed()
             } else {
@@ -230,7 +296,7 @@ impl Navigator {
                         let name = e.file_name().to_string_lossy().into_owned();
                         let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
                         if is_dir {
-                            format!("📁 {}", name)
+                            format!("{NF_OCT_FILE_DIRECTORY_FILL}  {}", name)
                         } else {
                             format!("   {}", name)
                         }

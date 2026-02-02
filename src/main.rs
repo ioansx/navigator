@@ -1,13 +1,15 @@
+use clap::Parser;
 use navigator::{
     error::{Kindx, Resultx},
-    log_store, run_navigator,
+    log_store, run_navigator, Args,
 };
 
 fn main() -> Resultx<()> {
+    let args = Args::parse();
     let rust_log = std::env::var("RUST_LOG").ok();
 
     log_store::init_logger(rust_log)?;
-    ratatui::run(run_navigator)
+    ratatui::run(|terminal| run_navigator(terminal, &args))
         .map_err(|e| e.ctx(Kindx::any("nav encountered an internal error")))?;
     Ok(())
 }
