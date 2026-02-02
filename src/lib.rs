@@ -55,12 +55,12 @@ pub fn run_navigator(terminal: &mut DefaultTerminal, args: &Args) -> Resultx<()>
                 KeyCode::Char('k') | KeyCode::Up => {
                     navigator.move_up();
                 }
-                KeyCode::Enter => {
+                KeyCode::Enter | KeyCode::Char('l') => {
                     if navigator.enter_selected()? {
                         return Ok(()); // File opened in neovim, quit navigator
                     }
                 }
-                KeyCode::Char('-') => {
+                KeyCode::Char('-') | KeyCode::Char('h') => {
                     navigator.go_to_parent_directory()?;
                 }
                 KeyCode::Char('L') => {

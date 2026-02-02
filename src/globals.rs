@@ -11,15 +11,15 @@ pub const NF_OCT_FILE_DIRECTORY_OPEN_FILL: &str = "\u{f07c}";
 pub const NF_FILE: &str = "\u{f15b}";
 
 // Gruvbox colors
-pub const GRUVBOX_BLUE: Color = Color::Rgb(131, 165, 152);    // #83a598 - directories
-pub const GRUVBOX_GREEN: Color = Color::Rgb(184, 187, 38);    // #b8bb26 - executables, code
-pub const GRUVBOX_AQUA: Color = Color::Rgb(142, 192, 124);    // #8ec07c - symlinks
-pub const GRUVBOX_RED: Color = Color::Rgb(251, 73, 52);       // #fb4934 - archives
-pub const GRUVBOX_PURPLE: Color = Color::Rgb(211, 134, 155);  // #d3869b - images, videos
-pub const GRUVBOX_ORANGE: Color = Color::Rgb(254, 128, 25);   // #fe8019 - audio
-pub const GRUVBOX_YELLOW: Color = Color::Rgb(250, 189, 47);   // #fabd2f - documents
-pub const GRUVBOX_GRAY: Color = Color::Rgb(146, 131, 116);    // #928374 - hidden files
-pub const GRUVBOX_FG: Color = Color::Rgb(235, 219, 178);      // #ebdbb2 - default
+pub const GRUVBOX_BLUE: Color = Color::Rgb(131, 165, 152); // #83a598 - directories
+pub const GRUVBOX_GREEN: Color = Color::Rgb(184, 187, 38); // #b8bb26 - executables, code
+pub const GRUVBOX_AQUA: Color = Color::Rgb(142, 192, 124); // #8ec07c - symlinks
+pub const GRUVBOX_RED: Color = Color::Rgb(251, 73, 52); // #fb4934 - archives
+pub const GRUVBOX_PURPLE: Color = Color::Rgb(211, 134, 155); // #d3869b - images, videos
+pub const GRUVBOX_ORANGE: Color = Color::Rgb(254, 128, 25); // #fe8019 - audio
+pub const GRUVBOX_YELLOW: Color = Color::Rgb(250, 189, 47); // #fabd2f - documents
+pub const GRUVBOX_GRAY: Color = Color::Rgb(146, 131, 116); // #928374 - hidden files
+pub const GRUVBOX_FG: Color = Color::Rgb(235, 219, 178); // #ebdbb2 - default
 
 pub fn file_color(name: &str, is_dir: bool) -> Color {
     if is_dir {
@@ -43,8 +43,8 @@ pub fn file_color(name: &str, is_dir: bool) -> Color {
         // Documents
         "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "odt" => GRUVBOX_YELLOW,
         // Code
-        "rs" | "go" | "py" | "js" | "ts" | "jsx" | "tsx" | "c" | "cpp" | "h" | "hpp"
-        | "java" | "rb" | "sh" | "bash" | "zsh" | "lua" | "vim" | "ex" | "exs" => GRUVBOX_GREEN,
+        "rs" | "go" | "py" | "js" | "ts" | "jsx" | "tsx" | "c" | "cpp" | "h" | "hpp" | "java"
+        | "rb" | "sh" | "bash" | "zsh" | "lua" | "vim" | "ex" | "exs" => GRUVBOX_GREEN,
         // Config/data
         "json" | "yaml" | "yml" | "toml" | "xml" | "html" | "css" | "scss" => GRUVBOX_AQUA,
         // Default
