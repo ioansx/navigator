@@ -63,9 +63,18 @@ impl Navigator {
             return Ok(false);
         }
 
-        let selected_entry = &self.entries[self.selected];
-        if selected_entry.is_dir {
-            let new_path = self.current_dir.join(&selected_entry.name);
+        let entry = &self.entries[self.selected];
+
+        if entry.is_dir {
+            if entry.name == "." {
+                log::info!(
+                    "Staying in the same directory: {}",
+                    self.current_dir.display()
+                );
+                return Ok(false);
+            }
+
+            let new_path = self.current_dir.join(&entry.name);
 
             log::info!("Entering directory: {}", new_path.display());
 
@@ -79,7 +88,7 @@ impl Navigator {
             Ok(false)
         } else {
             // File selected - open in neovim
-            let path = self.current_dir.join(&selected_entry.name);
+            let path = self.current_dir.join(&entry.name);
             self.open_in_neovim(&path)
         }
     }
