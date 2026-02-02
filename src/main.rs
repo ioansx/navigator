@@ -1,7 +1,8 @@
 use clap::Parser;
 use navigator::{
+    Args,
     error::{Kindx, Resultx},
-    log_store, run_navigator, Args,
+    log_store, run_navigator,
 };
 
 fn main() -> Resultx<()> {
