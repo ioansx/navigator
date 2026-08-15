@@ -3,6 +3,7 @@ pub mod log_store;
 
 mod globals;
 mod io;
+mod memory;
 mod navigator;
 
 use clap::Parser;

@@ -18,6 +18,7 @@ use crate::{
         file, nvim, raster,
     },
     log_store::LOG_STORE,
+    memory::Memory,
 };
 
 pub struct Navigator {
@@ -29,6 +30,7 @@ pub struct Navigator {
     cached_image: Option<(PathBuf, StatefulProtocol)>,
     log_panel_visible: bool,
     log_scroll_offset: usize,
+    memory: Memory,
 }
 
 impl Navigator {
@@ -37,9 +39,8 @@ impl Navigator {
         let entries = dir::read_dir_with_dots(&current_dir)?;
         let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
 
-        // Find the index of the file to select
         let selected = select
-            .and_then(|name| entries.iter().position(|e| e.name == name))
+            .and_then(|name| index_of(&entries, name))
             .unwrap_or(0);
 
         Ok(Self {
@@ -51,6 +52,7 @@ impl Navigator {
             cached_image: None,
             log_panel_visible: false,
             log_scroll_offset: 0,
+            memory: Memory::default(),
         })
     }
 
@@ -91,11 +93,35 @@ impl Navigator {
         Ok(())
     }
 
-    /// Switches to `path`, resetting the selection and any cached preview.
+    /// Switches to `path`, saving the cursor position here and restoring it there.
+    ///
+    /// Every directory change goes through this, so saving and restoring happen in
+    /// one place rather than at each call site.
     fn go_to(&mut self, path: PathBuf) -> Resultx<()> {
-        self.entries = dir::read_dir_with_dots(&path)?;
+        let entries = dir::read_dir_with_dots(&path)?;
+
+        if let Some(entry) = self.entries.get(self.selected) {
+            self.memory.remember(&self.current_dir, &entry.name);
+        }
+
+        // Only reached when `path` has never been visited: on the way up out of a
+        // directory we started in, that directory is still where we just were.
+        let came_from = self
+            .current_dir
+            .strip_prefix(&path)
+            .ok()
+            .and_then(|below| below.iter().next())
+            .map(|name| name.to_string_lossy().into_owned());
+
+        let selected = [self.memory.recall(&path), came_from.as_deref()]
+            .into_iter()
+            .flatten()
+            .find_map(|name| index_of(&entries, name))
+            .unwrap_or(0);
+
+        self.entries = entries;
         self.current_dir = path;
-        self.selected = 0;
+        self.selected = selected;
         self.scroll_offset = 0;
         self.cached_image = None;
         Ok(())
@@ -274,6 +300,10 @@ impl Navigator {
             line.render(row(inner, visible_height - 1 - i), buf);
         }
     }
+}
+
+fn index_of(entries: &[DirEntry], name: &str) -> Option<usize> {
+    entries.iter().position(|entry| entry.name == name)
 }
 
 /// Row `n` of `area`, counted from its top.
@@ -468,6 +498,125 @@ mod tests {
         nav.enter_selected().unwrap();
 
         assert!(nav.entries.iter().any(|e| e.name == "inside.txt"));
+    }
+
+    #[test]
+    fn going_up_highlights_the_directory_you_came_from() {
+        let tmp = TempDir::new();
+        tmp.dir("aaa");
+        tmp.dir("target");
+        tmp.dir("zzz");
+
+        let mut nav = open(tmp.path(), Some("target"));
+        nav.enter_selected().unwrap();
+        nav.go_to_parent_directory().unwrap();
+
+        assert_eq!(selected(&nav), "target");
+    }
+
+    #[test]
+    fn going_up_highlights_the_directory_you_started_in() {
+        // Started here by `nav <path>`, so the parent has never been visited and
+        // there is nothing remembered about it.
+        let tmp = TempDir::new();
+        tmp.dir("aaa");
+        tmp.dir("start");
+
+        let mut nav = open(&tmp.path().join("start"), None);
+        nav.go_to_parent_directory().unwrap();
+
+        assert_eq!(nav.current_dir, tmp.path());
+        assert_eq!(selected(&nav), "start");
+    }
+
+    #[test]
+    fn returning_to_a_directory_restores_the_cursor() {
+        let tmp = TempDir::new();
+        tmp.dir("sub");
+        tmp.file("aaa.txt", "");
+        tmp.file("zzz.txt", "");
+
+        // Leave the cursor on a file, not on the directory we descend into.
+        let mut nav = open(tmp.path(), Some("zzz.txt"));
+        nav.go_to(tmp.path().join("sub")).unwrap();
+        assert_eq!(selected(&nav), ".");
+
+        nav.go_to_parent_directory().unwrap();
+
+        assert_eq!(selected(&nav), "zzz.txt");
+    }
+
+    #[test]
+    fn a_remembered_position_survives_several_levels() {
+        let tmp = TempDir::new();
+        tmp.dir("a/b/c");
+        tmp.file("a/marker.txt", "");
+
+        let mut nav = open(tmp.path(), Some("a"));
+        nav.enter_selected().unwrap();
+        nav.selected = index_of(&nav.entries, "marker.txt").unwrap();
+        nav.go_to(tmp.path().join("a/b")).unwrap();
+        nav.enter_selected().unwrap(); // into `.`, stays put
+
+        nav.go_to_parent_directory().unwrap();
+
+        assert_eq!(nav.current_dir, tmp.path().join("a"));
+        assert_eq!(selected(&nav), "marker.txt");
+    }
+
+    #[test]
+    fn a_remembered_entry_that_is_gone_falls_back_to_where_you_came_from() {
+        let tmp = TempDir::new();
+        tmp.dir("sub");
+        let doomed = tmp.file("doomed.txt", "");
+
+        let mut nav = open(tmp.path(), Some("doomed.txt"));
+        nav.go_to(tmp.path().join("sub")).unwrap();
+        std::fs::remove_file(&doomed).unwrap();
+
+        nav.go_to_parent_directory().unwrap();
+
+        assert_eq!(selected(&nav), "sub");
+    }
+
+    #[test]
+    fn a_remembered_entry_that_is_gone_falls_back_to_the_top() {
+        let tmp = TempDir::new();
+        tmp.dir("here");
+        tmp.dir("elsewhere");
+        let doomed = tmp.file("here/doomed.txt", "");
+
+        // Sideways, so the directory we return from is not one of `here`'s entries.
+        let mut nav = open(&tmp.path().join("here"), Some("doomed.txt"));
+        nav.go_to(tmp.path().join("elsewhere")).unwrap();
+        std::fs::remove_file(&doomed).unwrap();
+        nav.go_to(tmp.path().join("here")).unwrap();
+
+        assert_eq!(selected(&nav), ".");
+    }
+
+    #[test]
+    fn a_directory_visited_for_the_first_time_starts_at_the_top() {
+        let tmp = TempDir::new();
+        tmp.file("sub/inside.txt", "");
+
+        let mut nav = open(tmp.path(), Some("sub"));
+        nav.enter_selected().unwrap();
+
+        assert_eq!(selected(&nav), ".");
+    }
+
+    #[test]
+    fn descending_does_not_inherit_the_parents_position() {
+        let tmp = TempDir::new();
+        tmp.file("aaa.txt", "");
+        tmp.file("sub/aaa.txt", "");
+
+        // `aaa.txt` exists in both, so a naive restore would land on it below too.
+        let mut nav = open(tmp.path(), Some("aaa.txt"));
+        nav.go_to(tmp.path().join("sub")).unwrap();
+
+        assert_eq!(selected(&nav), ".");
     }
 
     #[test]
