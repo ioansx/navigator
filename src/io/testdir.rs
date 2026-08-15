@@ -14,7 +14,7 @@ pub struct TempDir {
 }
 
 impl TempDir {
-    pub fn new() -> TempDir {
+    pub fn new() -> Self {
         let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!("nav-test-{}-{unique}", std::process::id()));
 
@@ -23,7 +23,7 @@ impl TempDir {
 
         // The OS temp dir is a symlink on macOS, and tests compare canonical paths.
         let path = fs::canonicalize(&path).expect("resolving the temp dir");
-        TempDir { path }
+        Self { path }
     }
 
     pub fn path(&self) -> &Path {

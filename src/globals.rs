@@ -39,7 +39,7 @@ pub fn file_color(name: &str, is_dir: bool) -> Color {
     }
 }
 
-pub fn level_color(level: Level) -> Color {
+pub const fn level_color(level: Level) -> Color {
     match level {
         Level::Error => Color::Red,
         Level::Warn => Color::Yellow,

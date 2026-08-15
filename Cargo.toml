@@ -2,10 +2,22 @@
 name = "navigator"
 version = "0.1.0"
 edition = "2024"
+description = "Terminal file navigator that opens files in the neovim instance around it"
+publish = false
 
 [[bin]]
 name = "nav"
 path = "src/main.rs"
+
+# `restriction` is deliberately left out: it is a menu of individually opt-in lints,
+# several of which contradict each other, not a group meant to be switched on.
+[lints.clippy]
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
+
+# Only transitive dependencies duplicate crates, so there is nothing to act on here.
+multiple_crate_versions = "allow"
 
 [profile.release]
 codegen-units = 1

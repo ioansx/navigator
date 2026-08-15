@@ -23,9 +23,9 @@ pub enum FileKind {
 }
 
 impl FileKind {
-    pub fn of(path: &Path, is_dir: bool) -> FileKind {
+    pub fn of(path: &Path, is_dir: bool) -> Self {
         if is_dir {
-            return FileKind::Dir;
+            return Self::Dir;
         }
 
         let ext = path
@@ -35,9 +35,9 @@ impl FileKind {
 
         match ext.as_str() {
             "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "ico" | "tiff" | "tif" | "svg" => {
-                FileKind::Image
+                Self::Image
             }
-            _ => FileKind::Text,
+            _ => Self::Text,
         }
     }
 }

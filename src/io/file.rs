@@ -49,7 +49,7 @@ fn read_head(path: &Path, max_bytes: usize) -> Resultx<Vec<u8>> {
 }
 
 /// Tab, newline, carriage return, or anything printable. Other control bytes mean binary.
-fn is_text_byte(byte: u8) -> bool {
+const fn is_text_byte(byte: u8) -> bool {
     byte >= 0x20 || matches!(byte, b'\t' | b'\n' | b'\r')
 }
 

@@ -30,7 +30,7 @@ pub fn read_dir(path: &Path) -> Resultx<Vec<DirEntry>> {
             log::error!("Failed to read directory {}: {}", path.display(), e);
             Errx::e_io(e, format!("reading {}", path.display()))
         })?
-        .filter_map(|entry| entry.ok())
+        .filter_map(Result::ok)
         .map(|entry| DirEntry {
             name: entry.file_name().to_string_lossy().into_owned(),
             is_dir: is_dir(&entry),

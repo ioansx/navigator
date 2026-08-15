@@ -19,7 +19,7 @@ impl Errx {
             };
         };
 
-        match src.downcast::<Errx>() {
+        match src.downcast::<Self>() {
             Ok(mut errx) => {
                 let bkt = errx.bkt.take();
                 Self {
@@ -36,6 +36,7 @@ impl Errx {
         }
     }
 
+    #[must_use]
     pub fn ctx(mut self, knd: Kindx) -> Self {
         let bkt = self.bkt.take();
         Self {
@@ -45,6 +46,7 @@ impl Errx {
         }
     }
 
+    #[must_use]
     pub fn of(knd: Kindx) -> Self {
         Self::new(None, knd)
     }
@@ -95,19 +97,19 @@ pub enum Kindx {
 }
 
 impl Kindx {
-    pub fn any(msg: impl Into<String>) -> Kindx {
-        Kindx::Any(msg.into())
+    pub fn any(msg: impl Into<String>) -> Self {
+        Self::Any(msg.into())
     }
 }
 
 impl Display for Kindx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Kindx::Any(msg) => {
-                write!(f, "Any: {}", msg)
+            Self::Any(msg) => {
+                write!(f, "Any: {msg}")
             }
-            Kindx::Io(msg) => {
-                write!(f, "IO: {}", msg)
+            Self::Io(msg) => {
+                write!(f, "IO: {msg}")
             }
         }
     }
@@ -115,6 +117,6 @@ impl Display for Kindx {
 
 impl From<std::io::Error> for Errx {
     fn from(e: std::io::Error) -> Self {
-        Errx::e_of(e, Kindx::Io("IO operation failed".into()))
+        Self::e_of(e, Kindx::Io("IO operation failed".into()))
     }
 }

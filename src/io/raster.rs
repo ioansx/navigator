@@ -1,7 +1,10 @@
 use std::{fs, path::Path};
 
 use image::DynamicImage;
-use resvg::{tiny_skia::Pixmap, usvg::Tree};
+use resvg::{
+    tiny_skia::{Pixmap, Transform},
+    usvg::{Options, Tree},
+};
 
 use crate::error::{Errx, Resultx};
 
@@ -22,13 +25,13 @@ fn is_svg(path: &Path) -> bool {
 fn rasterize_svg(path: &Path) -> Resultx<DynamicImage> {
     let data = fs::read(path).map_err(|e| Errx::e_io(e, format!("reading {}", path.display())))?;
 
-    let tree = Tree::from_data(&data, &Default::default())
+    let tree = Tree::from_data(&data, &Options::default())
         .map_err(|e| Errx::e_any(e, format!("parsing {}", path.display())))?;
 
     let size = tree.size().to_int_size();
     let mut pixmap = Pixmap::new(size.width(), size.height())
         .ok_or_else(|| Errx::any(format!("{} has no drawable area", path.display())))?;
-    resvg::render(&tree, Default::default(), &mut pixmap.as_mut());
+    resvg::render(&tree, Transform::default(), &mut pixmap.as_mut());
 
     image::RgbaImage::from_raw(size.width(), size.height(), pixmap.take())
         .map(DynamicImage::ImageRgba8)

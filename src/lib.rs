@@ -22,6 +22,10 @@ pub struct Args {
     pub select: Option<String>,
 }
 
+/// Runs the navigator until the user quits or opens a file in neovim.
+///
+/// # Errors
+/// Fails if a directory cannot be read, or if the terminal stops delivering events.
 pub fn run_navigator(terminal: &mut DefaultTerminal, args: &Args) -> Resultx<()> {
     use ratatui::crossterm::event::{KeyCode, KeyModifiers};
 
@@ -59,7 +63,7 @@ pub fn run_navigator(terminal: &mut DefaultTerminal, args: &Args) -> Resultx<()>
                         return Ok(()); // File opened in neovim, quit navigator
                     }
                 }
-                KeyCode::Char('-') | KeyCode::Char('h') => {
+                KeyCode::Char('-' | 'h') => {
                     navigator.go_to_parent_directory()?;
                 }
                 KeyCode::Char('L') => {

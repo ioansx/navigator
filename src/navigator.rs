@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use ratatui::{
-    layout::{Constraint, Layout, Rect},
+    layout::{Constraint, Layout, Offset, Rect},
     prelude::Buffer,
     style::{Color, Style},
     text::{Line, Span},
@@ -133,7 +133,7 @@ impl Navigator {
         }
     }
 
-    pub fn toggle_log_panel(&mut self) {
+    pub const fn toggle_log_panel(&mut self) {
         self.log_panel_visible = !self.log_panel_visible;
         self.log_scroll_offset = 0;
     }
@@ -151,7 +151,7 @@ impl Navigator {
             let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).split(area);
 
             self.render_with_preview(chunks[0], buf);
-            self.render_status_line(chunks[1], buf);
+            render_status_line(chunks[1], buf);
         }
     }
 
@@ -188,20 +188,14 @@ impl Navigator {
             .skip(self.scroll_offset)
             .take(visible_height)
         {
-            let y = (i - self.scroll_offset) as i32;
-            let icon = if entry.is_dir {
-                NF_OCT_FILE_DIRECTORY_FILL
-            } else {
-                " "
-            };
             let color = file_color(&entry.name, entry.is_dir);
             let style = if i == self.selected {
                 Style::new().fg(color).reversed()
             } else {
                 Style::new().fg(color)
             };
-            let line = Line::styled(format!("{}  {}", icon, entry.name), style);
-            line.render(inner.offset(ratatui::layout::Offset { x: 0, y }), buf);
+            let line = Line::styled(format!("{}  {}", icon_for(entry), entry.name), style);
+            line.render(row(inner, i - self.scroll_offset), buf);
         }
     }
 
@@ -212,32 +206,10 @@ impl Navigator {
 
         let path = self.current_dir.join(&entry.name);
         match FileKind::of(&path, entry.is_dir) {
-            FileKind::Dir => self.render_directory_preview(&path, area, buf),
+            FileKind::Dir => render_directory_preview(&path, area, buf),
             FileKind::Image => self.render_image_preview(&path, area, buf),
-            FileKind::Text => self.render_text_preview(&path, area, buf),
+            FileKind::Text => render_text_preview(&path, area, buf),
         }
-    }
-
-    fn render_directory_preview(&self, path: &Path, area: Rect, buf: &mut Buffer) {
-        let content = match dir::read_dir(path) {
-            Ok(entries) if entries.is_empty() => "(empty directory)".to_string(),
-            Ok(entries) => entries
-                .iter()
-                .take(area.height as usize)
-                .map(|entry| {
-                    let icon = if entry.is_dir {
-                        NF_OCT_FILE_DIRECTORY_FILL
-                    } else {
-                        " "
-                    };
-                    format!("{icon}  {}", entry.name)
-                })
-                .collect::<Vec<_>>()
-                .join("\n"),
-            Err(_) => "(cannot read directory)".to_string(),
-        };
-
-        Paragraph::new(content).render(area, buf);
     }
 
     fn render_image_preview(&mut self, path: &Path, area: Rect, buf: &mut Buffer) {
@@ -265,46 +237,6 @@ impl Navigator {
         }
     }
 
-    fn render_text_preview(&self, path: &Path, area: Rect, buf: &mut Buffer) {
-        let content = file::read_text_preview(path, area.height as usize);
-        Paragraph::new(content).render(area, buf);
-    }
-
-    fn render_status_line(&self, area: Rect, buf: &mut Buffer) {
-        let Some(store) = LOG_STORE.get() else {
-            return;
-        };
-
-        let Some(entry) = store.latest() else {
-            return;
-        };
-
-        let elapsed = store.time_since_start() - store.elapsed_since(&entry);
-        let elapsed_secs = elapsed.as_secs();
-        let time_str = if elapsed_secs < 60 {
-            format!("({}s)", elapsed_secs)
-        } else {
-            format!("({}m)", elapsed_secs / 60)
-        };
-
-        let block = Block::default().borders(Borders::TOP);
-        let inner = block.inner(area);
-        block.render(area, buf);
-
-        let line = Line::from(vec![
-            Span::styled(
-                format!("[{}]", entry.level.as_str()),
-                Style::default().fg(level_color(entry.level)),
-            ),
-            Span::raw(" "),
-            Span::raw(&entry.message),
-            Span::raw(" "),
-            Span::styled(time_str, Style::default().fg(Color::DarkGray)),
-        ]);
-
-        line.render(inner, buf);
-    }
-
     fn render_log_panel(&mut self, area: Rect, buf: &mut Buffer) {
         let block = Block::default().borders(Borders::TOP);
         let inner = block.inner(area);
@@ -316,17 +248,13 @@ impl Navigator {
 
         let entries = store.entries();
         let visible_height = inner.height as usize;
-        let total_entries = entries.len();
 
-        // Adjust scroll to keep within bounds
-        if total_entries > visible_height {
-            let max_offset = total_entries.saturating_sub(visible_height);
-            self.log_scroll_offset = self.log_scroll_offset.min(max_offset);
-        } else {
-            self.log_scroll_offset = 0;
-        }
+        // Keep the scroll within bounds as the panel resizes or entries expire.
+        self.log_scroll_offset = self
+            .log_scroll_offset
+            .min(entries.len().saturating_sub(visible_height));
 
-        // Render from bottom (newest at bottom)
+        // Newest at the bottom, so the first entry drawn goes on the last row.
         for (i, entry) in entries
             .iter()
             .rev()
@@ -334,8 +262,6 @@ impl Navigator {
             .take(visible_height)
             .enumerate()
         {
-            let y = (visible_height - 1 - i) as i32;
-
             let line = Line::from(vec![
                 Span::styled(
                     format!("[{}]", entry.level.as_str()),
@@ -345,9 +271,80 @@ impl Navigator {
                 Span::raw(&entry.message),
             ]);
 
-            line.render(inner.offset(ratatui::layout::Offset { x: 0, y }), buf);
+            line.render(row(inner, visible_height - 1 - i), buf);
         }
     }
+}
+
+/// Row `n` of `area`, counted from its top.
+fn row(area: Rect, n: usize) -> Rect {
+    let y = i32::try_from(n).unwrap_or(i32::MAX);
+    area.offset(Offset { x: 0, y })
+}
+
+const fn icon_for(entry: &DirEntry) -> &'static str {
+    if entry.is_dir {
+        NF_OCT_FILE_DIRECTORY_FILL
+    } else {
+        " "
+    }
+}
+
+fn render_directory_preview(path: &Path, area: Rect, buf: &mut Buffer) {
+    let content = match dir::read_dir(path) {
+        Ok(entries) if entries.is_empty() => "(empty directory)".to_string(),
+        Ok(entries) => entries
+            .iter()
+            .take(area.height as usize)
+            .map(|entry| format!("{}  {}", icon_for(entry), entry.name))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Err(_) => "(cannot read directory)".to_string(),
+    };
+
+    Paragraph::new(content).render(area, buf);
+}
+
+fn render_text_preview(path: &Path, area: Rect, buf: &mut Buffer) {
+    let content = file::read_text_preview(path, area.height as usize);
+    Paragraph::new(content).render(area, buf);
+}
+
+fn render_status_line(area: Rect, buf: &mut Buffer) {
+    let Some(store) = LOG_STORE.get() else {
+        return;
+    };
+
+    let Some(entry) = store.latest() else {
+        return;
+    };
+
+    let elapsed = store
+        .time_since_start()
+        .saturating_sub(store.elapsed_since(&entry));
+    let elapsed_secs = elapsed.as_secs();
+    let time_str = if elapsed_secs < 60 {
+        format!("({elapsed_secs}s)")
+    } else {
+        format!("({}m)", elapsed_secs / 60)
+    };
+
+    let block = Block::default().borders(Borders::TOP);
+    let inner = block.inner(area);
+    block.render(area, buf);
+
+    let line = Line::from(vec![
+        Span::styled(
+            format!("[{}]", entry.level.as_str()),
+            Style::default().fg(level_color(entry.level)),
+        ),
+        Span::raw(" "),
+        Span::raw(&entry.message),
+        Span::raw(" "),
+        Span::styled(time_str, Style::default().fg(Color::DarkGray)),
+    ]);
+
+    line.render(inner, buf);
 }
 
 #[cfg(test)]

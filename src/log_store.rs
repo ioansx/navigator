@@ -14,6 +14,10 @@ const UNLOCK_MSG: &str = "LOG_STORE lock should not be poisoned";
 
 pub static LOG_STORE: OnceLock<LogStore> = OnceLock::new();
 
+/// Routes the `log` crate into [`LOG_STORE`], filtered by `rust_log` (default `info`).
+///
+/// # Errors
+/// Fails if a logger was already installed.
 pub fn init_logger(rust_log: Option<String>) -> Resultx<()> {
     let level_filter = rust_log
         .and_then(|x| log::LevelFilter::from_str(&x).ok())
@@ -46,10 +50,13 @@ impl LogStore {
         }
     }
 
-    pub fn len(&self) -> usize {
+    /// Not part of the public API: only the log panel needs this, to clamp its scroll.
+    pub(crate) fn len(&self) -> usize {
         self.entries.read().expect(UNLOCK_MSG).len()
     }
 
+    /// # Panics
+    /// Only if a thread panicked while holding the lock, which nothing here does.
     pub fn entries(&self) -> Vec<LogEntry> {
         self.entries
             .read()
@@ -59,6 +66,8 @@ impl LogStore {
             .collect()
     }
 
+    /// # Panics
+    /// Only if a thread panicked while holding the lock, which nothing here does.
     pub fn latest(&self) -> Option<LogEntry> {
         self.entries.read().expect(UNLOCK_MSG).back().cloned()
     }
@@ -88,7 +97,7 @@ impl Log for LogStore {
     fn log(&self, record: &Record) {
         if self.enabled(record.metadata()) {
             let entry = LogEntry {
-                level: record.level().into(),
+                level: record.level(),
                 message: record.args().to_string(),
                 timestamp: Instant::now(),
             };
