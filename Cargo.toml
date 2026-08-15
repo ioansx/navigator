@@ -14,13 +14,42 @@ opt-level = 3
 strip = true
 
 [dependencies]
-clap = { version = "4.5.56", features = ["derive"] }
-log = "0.4"
-crossterm = "0.29.0"
-image = "0.25.9"
-ratatui = "0.30.0"
-resvg = "0.46.0"
-ratatui-image = { version = "10.0.4", default-features = false, features = [
-	"image-defaults",
+log = "0.4.33"
+
+# Only `derive` + enough of the builder for a usable --help and error messages.
+clap = { version = "4.6.6", default-features = false, features = [
+	"std",
+	"derive",
+	"help",
+	"usage",
+	"error-context",
+] }
+
+# Decoders for the extensions `preview::image_preview::is_image` accepts.
+# Defaults would also build an AV1 encoder (rav1e) and OpenEXR, which a viewer never needs.
+image = { version = "0.25.10", default-features = false, features = [
+	"png",
+	"jpeg",
+	"gif",
+	"bmp",
+	"webp",
+	"ico",
+	"tiff",
+] }
+
+# `crossterm` re-exported via `ratatui::crossterm`, so no direct dependency.
+# Dropped from defaults: the calendar widget, ratatui-macros, and underline-color.
+ratatui = { version = "0.30.2", default-features = false, features = [
 	"crossterm",
+	"layout-cache",
+] }
+ratatui-image = { version = "11.0.6", default-features = false, features = [
+	"crossterm",
+] }
+
+# `text` + `system-fonts` keep text in SVGs rendering. `raster-images` (for SVGs
+# that embed a PNG/JPEG) is dropped.
+resvg = { version = "0.48.1", default-features = false, features = [
+	"text",
+	"system-fonts",
 ] }

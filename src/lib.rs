@@ -24,7 +24,7 @@ pub struct Args {
 }
 
 pub fn run_navigator(terminal: &mut DefaultTerminal, args: &Args) -> Resultx<()> {
-    use crossterm::event::{KeyCode, KeyModifiers};
+    use ratatui::crossterm::event::{KeyCode, KeyModifiers};
 
     log::info!("Navigator started in: {}", args.path);
 
@@ -34,7 +34,7 @@ pub fn run_navigator(terminal: &mut DefaultTerminal, args: &Args) -> Resultx<()>
             navigator.render(frame.area(), frame.buffer_mut());
         })?;
 
-        let event = crossterm::event::read()?;
+        let event = ratatui::crossterm::event::read()?;
         if let Some(key_event) = event.as_key_event() {
             let ctrl = key_event.modifiers.contains(KeyModifiers::CONTROL);
 

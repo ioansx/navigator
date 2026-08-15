@@ -31,7 +31,6 @@ pub struct LogEntry {
     pub level: Level,
     pub message: String,
     pub timestamp: Instant,
-    pub target: String,
 }
 
 pub struct LogStore {
@@ -92,7 +91,6 @@ impl Log for LogStore {
                 level: record.level().into(),
                 message: record.args().to_string(),
                 timestamp: Instant::now(),
-                target: record.target().to_string(),
             };
             self.push(entry);
         }

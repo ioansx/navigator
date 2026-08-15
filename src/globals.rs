@@ -4,11 +4,7 @@ pub const SCROLL_JUMP: usize = 8;
 pub const SCROLL_OFF: usize = 8;
 
 // Nerd Font icons
-pub const NF_OCT_FILE_DIRECTORY: &str = "\u{f07b}";
-pub const NF_OCT_FILE_SYMLINK_DIRECTORY: &str = "\u{f482}";
 pub const NF_OCT_FILE_DIRECTORY_FILL: &str = "\u{f07b}";
-pub const NF_OCT_FILE_DIRECTORY_OPEN_FILL: &str = "\u{f07c}";
-pub const NF_FILE: &str = "\u{f15b}";
 
 // Gruvbox colors
 pub const GRUVBOX_BLUE: Color = Color::Rgb(131, 165, 152); // #83a598 - directories

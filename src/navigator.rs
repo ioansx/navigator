@@ -1,4 +1,4 @@
-use std::{env, fs, io::Read, path::PathBuf, process::Command};
+use std::{env, fs, path::PathBuf, process::Command};
 
 use log::Level;
 use ratatui::{
@@ -15,7 +15,7 @@ use crate::{
     globals::{NF_OCT_FILE_DIRECTORY_FILL, SCROLL_OFF, file_color},
     io::dir::{DirEntry, read_dir},
     log_store::LOG_STORE,
-    preview::{image_preview, svg_preview},
+    preview::{image_preview, svg_preview, text_file_preview},
 };
 
 pub struct Navigator {
@@ -64,33 +64,27 @@ impl Navigator {
         }
 
         let entry = &self.entries[self.selected];
+        let name = entry.name.clone();
 
-        if entry.is_dir {
-            if entry.name == "." {
-                log::info!(
-                    "Staying in the same directory: {}",
-                    self.current_dir.display()
-                );
-                return Ok(false);
-            }
-
-            let new_path = self.current_dir.join(&entry.name);
-
-            log::info!("Entering directory: {}", new_path.display());
-
-            let entries = read_dir(&new_path)?;
-
-            self.current_dir = new_path;
-            self.entries = entries;
-            self.selected = 0;
-            self.scroll_offset = 0;
-            self.cached_image = None;
-            Ok(false)
-        } else {
+        if !entry.is_dir {
             // File selected - open in neovim
-            let path = self.current_dir.join(&entry.name);
-            self.open_in_neovim(&path)
+            let path = self.current_dir.join(&name);
+            return self.open_in_neovim(&path);
         }
+
+        match name.as_str() {
+            "." => log::info!(
+                "Staying in the same directory: {}",
+                self.current_dir.display()
+            ),
+            ".." => self.go_to_parent_directory()?,
+            name => {
+                let new_path = self.current_dir.join(name);
+                log::info!("Entering directory: {}", new_path.display());
+                self.go_to(new_path)?;
+            }
+        }
+        Ok(false)
     }
 
     /// Opens a file in the parent neovim instance via the NVIM socket.
@@ -155,14 +149,18 @@ impl Navigator {
             }
 
             log::info!("Going to parent: {}", parent.display());
-
-            let entries = read_dir(&parent.to_path_buf())?;
-            self.current_dir = parent.to_path_buf();
-            self.entries = entries;
-            self.selected = 0;
-            self.scroll_offset = 0;
-            self.cached_image = None;
+            self.go_to(parent.to_path_buf())?;
         }
+        Ok(())
+    }
+
+    /// Switches to `path`, resetting the selection and any cached preview.
+    fn go_to(&mut self, path: PathBuf) -> Resultx<()> {
+        self.entries = read_dir(&path)?;
+        self.current_dir = path;
+        self.selected = 0;
+        self.scroll_offset = 0;
+        self.cached_image = None;
         Ok(())
     }
 
@@ -367,7 +365,7 @@ impl Navigator {
     }
 
     fn render_text_preview(&self, path: &PathBuf, area: Rect, buf: &mut Buffer) {
-        let content = read_file_preview(path, area.height as usize);
+        let content = text_file_preview::read_text_file_preview(path, area.height as usize);
         Paragraph::new(content).render(area, buf);
     }
 
@@ -467,27 +465,39 @@ impl Navigator {
     }
 }
 
-fn read_file_preview(path: &PathBuf, max_lines: usize) -> String {
-    let Ok(mut file) = fs::File::open(path) else {
-        return "(cannot read file)".to_string();
-    };
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let mut buffer = vec![0u8; 8192];
-    let bytes_read = match file.read(&mut buffer) {
-        Ok(n) => n,
-        Err(_) => return "(cannot read file)".to_string(),
-    };
-
-    buffer.truncate(bytes_read);
-
-    // Check if content appears to be binary
-    let null_count = buffer.iter().filter(|b| **b == 0).count();
-    if null_count > 0 || buffer.iter().any(|b| *b < 0x09 && *b != 0x00) {
-        return "(binary file)".to_string();
+    fn render_to_string(nav: &mut Navigator, width: u16, height: u16) -> String {
+        let area = Rect::new(0, 0, width, height);
+        let mut buf = Buffer::empty(area);
+        nav.render(area, &mut buf);
+        (0..height)
+            .map(|y| (0..width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
-    match String::from_utf8(buffer) {
-        Ok(text) => text.lines().take(max_lines).collect::<Vec<_>>().join("\n"),
-        Err(_) => "(binary file)".to_string(),
+    #[test]
+    fn renders_directory_listing() {
+        let mut nav = Navigator::new("src", None).unwrap();
+        let out = render_to_string(&mut nav, 80, 24);
+        assert!(out.contains("navigator.rs"), "missing entry in:\n{out}");
+        assert!(out.contains("preview"), "missing subdir in:\n{out}");
+    }
+
+    #[test]
+    fn dot_dot_goes_up_without_appending_to_the_path() {
+        let mut nav = Navigator::new("src", None).unwrap();
+        let start = nav.current_dir.clone();
+
+        // `..` is the second entry, after `.`.
+        nav.selected = 1;
+        assert_eq!(nav.entries[nav.selected].name, "..");
+        nav.enter_selected().unwrap();
+
+        assert_eq!(nav.current_dir, start.parent().unwrap());
+        assert!(nav.entries.iter().any(|e| e.name == "Cargo.toml"));
     }
 }
