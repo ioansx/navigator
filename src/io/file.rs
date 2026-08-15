@@ -16,6 +16,11 @@ pub fn read_text_preview(path: &Path, max_lines: usize) -> String {
     }
 }
 
+/// Whether `bytes` are text rather than the innards of some binary format.
+pub fn looks_like_text(bytes: &[u8]) -> bool {
+    bytes.iter().all(|byte| is_text_byte(*byte)) && std::str::from_utf8(bytes).is_ok()
+}
+
 /// The first `max_lines` of `head` as text, or `None` if `head` is not text.
 ///
 /// `head` is only the start of a file, so its last character may be cut in half.

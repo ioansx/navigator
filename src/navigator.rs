@@ -1,9 +1,10 @@
 use std::path::{Path, PathBuf};
 
 use ratatui::{
+    crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
     layout::{Constraint, Layout, Offset, Rect},
     prelude::Buffer,
-    style::{Color, Style},
+    style::{Color, Style, Stylize},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, StatefulWidget, Widget},
 };
@@ -11,15 +12,99 @@ use ratatui_image::{StatefulImage, picker::Picker, protocol::StatefulProtocol};
 
 use crate::{
     error::Resultx,
-    globals::{NF_OCT_FILE_DIRECTORY_FILL, SCROLL_OFF, file_color, level_color},
+    globals::{NF_OCT_FILE_DIRECTORY_FILL, SCROLL_JUMP, SCROLL_OFF, file_color, level_color},
     io::{
-        FileKind,
+        FileKind, clipboard,
         dir::{self, DirEntry},
-        file, nvim, raster,
+        file, fs_ops, nvim, raster,
     },
     log_store::LOG_STORE,
+    marks::Marks,
     memory::Memory,
+    plan::{Op, Plan, Staged, validate_name},
 };
+
+/// How many staged operations the plan panel shows before it stops growing.
+const PLAN_PANEL_ROWS: usize = 6;
+
+/// What the keyboard currently means.
+pub enum Mode {
+    Normal,
+    /// Looking at the staged plan, deciding whether to run it.
+    Review,
+    /// Typing a name.
+    Prompt(Prompt),
+    /// Reading the key map.
+    Help,
+}
+
+struct HelpSection {
+    title: &'static str,
+    keys: &'static [(&'static str, &'static str)],
+}
+
+/// The key map, kept directly above the handler it describes so the two are read
+/// and edited together.
+const HELP: &[HelpSection] = &[
+    HelpSection {
+        title: "moving around",
+        keys: &[
+            ("j / k", "up and down"),
+            ("ctrl-d/u", "jump by a screenful"),
+            ("enter / l", "enter dir, or open in neovim"),
+            ("- / h", "go up a level"),
+            ("q", "quit"),
+        ],
+    },
+    HelpSection {
+        title: "marking",
+        keys: &[("space", "mark or unmark"), ("esc", "clear every mark")],
+    },
+    HelpSection {
+        title: "staging",
+        keys: &[
+            ("c", "copy marked here"),
+            ("m", "move marked here"),
+            ("d", "trash marked"),
+            ("a", "new file"),
+            ("A", "new directory"),
+            ("r", "rename this entry"),
+        ],
+    },
+    HelpSection {
+        title: "the plan",
+        keys: &[
+            ("p", "review the plan"),
+            ("enter", "apply it"),
+            ("x", "drop this operation"),
+            ("X", "drop everything blocked"),
+            ("r", "rename its destination"),
+            ("esc", "back, keeping the plan"),
+        ],
+    },
+    HelpSection {
+        title: "and also",
+        keys: &[
+            ("y", "contents to the clipboard"),
+            ("L", "show the log"),
+            ("?", "these keys"),
+        ],
+    },
+];
+
+pub struct Prompt {
+    label: &'static str,
+    input: String,
+    action: PromptAction,
+}
+
+enum PromptAction {
+    CreateFile,
+    CreateDir,
+    Rename(PathBuf),
+    /// Change where staged operation `n` writes to.
+    Retarget(usize),
+}
 
 pub struct Navigator {
     current_dir: PathBuf,
@@ -31,6 +116,10 @@ pub struct Navigator {
     log_panel_visible: bool,
     log_scroll_offset: usize,
     memory: Memory,
+    marks: Marks,
+    plan: Plan,
+    mode: Mode,
+    review_selected: usize,
 }
 
 impl Navigator {
@@ -53,7 +142,101 @@ impl Navigator {
             log_panel_visible: false,
             log_scroll_offset: 0,
             memory: Memory::default(),
+            marks: Marks::default(),
+            plan: Plan::default(),
+            mode: Mode::Normal,
+            review_selected: 0,
         })
+    }
+
+    /// Handles one keypress. Returns `Ok(true)` when the navigator should quit.
+    pub fn handle_key(&mut self, key: KeyEvent) -> Resultx<bool> {
+        match self.mode {
+            Mode::Prompt(_) => {
+                self.handle_prompt_key(key);
+                Ok(false)
+            }
+            Mode::Review => self.handle_review_key(key),
+            Mode::Normal => self.handle_normal_key(key),
+            Mode::Help => {
+                // Anything at all dismisses it: nobody should have to guess twice.
+                self.mode = Mode::Normal;
+                Ok(false)
+            }
+        }
+    }
+
+    fn handle_normal_key(&mut self, key: KeyEvent) -> Resultx<bool> {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+        match key.code {
+            KeyCode::Char('q') => {
+                log::info!("Navigator quit");
+                return Ok(true);
+            }
+            KeyCode::Char('d') if ctrl => self.move_down_by(SCROLL_JUMP),
+            KeyCode::Char('u') if ctrl => self.move_up_by(SCROLL_JUMP),
+            KeyCode::Char('j') | KeyCode::Down => self.move_down(),
+            KeyCode::Char('k') | KeyCode::Up => self.move_up(),
+            KeyCode::Enter | KeyCode::Char('l') => return self.enter_selected(),
+            KeyCode::Char('-' | 'h') => self.go_to_parent_directory()?,
+            KeyCode::Char('L') => self.toggle_log_panel(),
+
+            KeyCode::Char(' ') => self.toggle_mark(),
+            KeyCode::Esc => self.clear_marks(),
+            KeyCode::Char('c') => self.stage_into_here(|from, to| Op::Copy { from, to }),
+            KeyCode::Char('m') => self.stage_into_here(|from, to| Op::Move { from, to }),
+            KeyCode::Char('d') => self.stage_trash(),
+            KeyCode::Char('a') => self.begin_prompt("new file", PromptAction::CreateFile),
+            KeyCode::Char('A') => self.begin_prompt("new directory", PromptAction::CreateDir),
+            KeyCode::Char('r') => self.begin_rename(),
+            KeyCode::Char('y') => self.yank_to_clipboard(),
+            KeyCode::Char('p') => self.open_review(),
+            KeyCode::Char('?') => self.mode = Mode::Help,
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    fn handle_review_key(&mut self, key: KeyEvent) -> Resultx<bool> {
+        match key.code {
+            KeyCode::Char('q') => return Ok(true),
+            KeyCode::Esc | KeyCode::Char('p') => self.mode = Mode::Normal,
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.review_selected = (self.review_selected + 1).min(self.plan.len().max(1) - 1);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.review_selected = self.review_selected.saturating_sub(1);
+            }
+            KeyCode::Char('x') => {
+                self.plan.remove(self.review_selected);
+                self.clamp_review();
+            }
+            KeyCode::Char('X') => {
+                self.plan.drop_blocked(|op| fs_ops::problem(op).is_some());
+                self.clamp_review();
+            }
+            KeyCode::Char('r') => self.begin_retarget(),
+            KeyCode::Enter => self.apply_plan()?,
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    fn handle_prompt_key(&mut self, key: KeyEvent) {
+        let Mode::Prompt(prompt) = &mut self.mode else {
+            return;
+        };
+
+        match key.code {
+            KeyCode::Char(c) => prompt.input.push(c),
+            KeyCode::Backspace => {
+                prompt.input.pop();
+            }
+            KeyCode::Esc => self.mode = Mode::Normal,
+            KeyCode::Enter => self.confirm_prompt(),
+            _ => {}
+        }
     }
 
     /// Returns `Ok(true)` if the navigator should quit (file opened in neovim).
@@ -127,6 +310,222 @@ impl Navigator {
         Ok(())
     }
 
+    /// The entry under the cursor, unless it is one of the `.` / `..` shortcuts,
+    /// which name directories that operations must never be pointed at.
+    fn cursor_path(&self) -> Option<PathBuf> {
+        let entry = self.entries.get(self.selected)?;
+        let navigational = entry.name == "." || entry.name == "..";
+        (!navigational).then(|| self.current_dir.join(&entry.name))
+    }
+
+    /// What a staging key acts on: everything marked, or the entry under the
+    /// cursor when nothing is. Single-file work should not need a mark first.
+    fn targets(&self) -> Vec<PathBuf> {
+        if self.marks.is_empty() {
+            return self.cursor_path().into_iter().collect();
+        }
+        self.marks.iter().cloned().collect()
+    }
+
+    fn toggle_mark(&mut self) {
+        let Some(path) = self.cursor_path() else {
+            return;
+        };
+
+        if self.marks.toggle(&path) {
+            log::info!("Marked {}", path.display());
+        } else {
+            log::info!("Unmarked {}", path.display());
+        }
+    }
+
+    fn clear_marks(&mut self) {
+        if !self.marks.is_empty() {
+            log::info!("Cleared {} marks", self.marks.len());
+            self.marks.clear();
+        }
+    }
+
+    /// Stages one operation per target, landing in the directory being viewed.
+    fn stage_into_here(&mut self, build: impl Fn(PathBuf, PathBuf) -> Op) {
+        let mut staged = 0;
+        for from in self.targets() {
+            let Some(name) = from.file_name() else {
+                continue;
+            };
+            let to = self.current_dir.join(name);
+            self.plan.push(build(from, to));
+            staged += 1;
+        }
+        log::info!(
+            "Staged {staged} operation(s) into {}",
+            self.current_dir.display()
+        );
+    }
+
+    fn stage_trash(&mut self) {
+        let targets = self.targets();
+        for path in &targets {
+            self.plan.push(Op::Trash(path.clone()));
+        }
+        log::info!("Staged {} for the trash", targets.len());
+    }
+
+    fn begin_prompt(&mut self, label: &'static str, action: PromptAction) {
+        self.mode = Mode::Prompt(Prompt {
+            label,
+            input: String::new(),
+            action,
+        });
+    }
+
+    fn begin_rename(&mut self) {
+        let Some(path) = self.cursor_path() else {
+            return;
+        };
+
+        let current = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+
+        self.mode = Mode::Prompt(Prompt {
+            label: "rename to",
+            input: current,
+            action: PromptAction::Rename(path),
+        });
+    }
+
+    fn begin_retarget(&mut self) {
+        let Some(staged) = self.plan.iter().nth(self.review_selected) else {
+            return;
+        };
+
+        let current = staged
+            .op
+            .destination()
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+
+        self.mode = Mode::Prompt(Prompt {
+            label: "destination name",
+            input: current,
+            action: PromptAction::Retarget(self.review_selected),
+        });
+    }
+
+    fn confirm_prompt(&mut self) {
+        // Taken out so the plan can be edited; put back if the name is unusable.
+        let Mode::Prompt(prompt) = std::mem::replace(&mut self.mode, Mode::Normal) else {
+            return;
+        };
+
+        let name = prompt.input.trim().to_string();
+        if let Some(problem) = validate_name(&name) {
+            log::warn!("{name:?} is {problem}");
+            self.mode = Mode::Prompt(prompt);
+            return;
+        }
+
+        match prompt.action {
+            PromptAction::CreateFile => self.plan.push(Op::CreateFile(self.current_dir.join(name))),
+            PromptAction::CreateDir => self.plan.push(Op::CreateDir(self.current_dir.join(name))),
+            PromptAction::Rename(from) => {
+                let to = self.current_dir.join(name);
+                self.plan.push(Op::Move { from, to });
+            }
+            PromptAction::Retarget(index) => {
+                if let Some(staged) = self.plan.get_mut(index) {
+                    staged.op.retarget(&name);
+                }
+                self.mode = Mode::Review;
+            }
+        }
+    }
+
+    fn open_review(&mut self) {
+        if self.plan.is_empty() {
+            log::info!("Nothing staged");
+            return;
+        }
+        self.clamp_review();
+        self.mode = Mode::Review;
+    }
+
+    fn clamp_review(&mut self) {
+        self.review_selected = self.review_selected.min(self.plan.len().saturating_sub(1));
+    }
+
+    /// Runs every staged operation in order, keeping going past any that fail.
+    ///
+    /// A filesystem has no transactions, so stopping at the first failure would
+    /// leave a half-applied plan with no account of which half.
+    fn apply_plan(&mut self) -> Resultx<()> {
+        if self.plan.ops().any(|op| fs_ops::problem(op).is_some()) {
+            log::warn!("Blocked operations in the plan - drop them with x or X");
+            return Ok(());
+        }
+
+        let ops: Vec<Op> = self.plan.ops().cloned().collect();
+        let mut failures = Vec::new();
+
+        for op in ops {
+            if let Err(e) = fs_ops::apply(&op) {
+                log::error!("{e}");
+                failures.push((op, e.to_string()));
+            }
+        }
+
+        let failed = failures.len();
+        self.plan.keep_failures(failures);
+        self.marks.clear();
+        self.mode = if failed == 0 {
+            Mode::Normal
+        } else {
+            Mode::Review
+        };
+        self.clamp_review();
+        self.refresh()?;
+
+        if failed == 0 {
+            log::info!("Plan applied");
+        } else {
+            log::error!("{failed} operation(s) failed and are still staged");
+        }
+        Ok(())
+    }
+
+    fn yank_to_clipboard(&self) {
+        let Some(path) = self.cursor_path() else {
+            return;
+        };
+
+        match clipboard::copy_file(&path) {
+            Ok(bytes) => log::info!("Copied {bytes} bytes to the clipboard"),
+            Err(e) => log::warn!("{e}"),
+        }
+    }
+
+    /// Re-reads the current directory, keeping the cursor on the same entry when
+    /// it is still there.
+    fn refresh(&mut self) -> Resultx<()> {
+        let entries = dir::read_dir_with_dots(&self.current_dir)?;
+        let under_cursor = self
+            .entries
+            .get(self.selected)
+            .map(|entry| entry.name.clone());
+
+        self.selected = under_cursor
+            .and_then(|name| index_of(&entries, &name))
+            .unwrap_or(0);
+        self.entries = entries;
+        self.cached_image = None;
+        Ok(())
+    }
+
     pub fn move_up(&mut self) {
         self.move_up_by(1);
     }
@@ -165,6 +564,16 @@ impl Navigator {
     }
 
     pub fn render(&mut self, area: Rect, buf: &mut Buffer) {
+        if matches!(self.mode, Mode::Help) {
+            render_help(area, buf);
+            return;
+        }
+
+        if matches!(self.mode, Mode::Review) {
+            self.render_review(area, buf);
+            return;
+        }
+
         if self.log_panel_visible {
             // Expanded: file list on top, log panel takes bottom 70%
             let chunks = Layout::vertical([Constraint::Percentage(30), Constraint::Percentage(70)])
@@ -172,13 +581,141 @@ impl Navigator {
 
             self.render_file_list(chunks[0], buf);
             self.render_log_panel(chunks[1], buf);
-        } else {
-            // Collapsed: file list + preview on top, status line at bottom
-            let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).split(area);
-
-            self.render_with_preview(chunks[0], buf);
-            render_status_line(chunks[1], buf);
+            return;
         }
+
+        // File list + preview, the staged plan when there is one, then one line
+        // that is either what you are typing or the latest message.
+        let plan_rows = if self.plan.is_empty() {
+            0
+        } else {
+            u16::try_from(self.plan.len().min(PLAN_PANEL_ROWS) + 1).unwrap_or(u16::MAX)
+        };
+
+        let chunks = Layout::vertical([
+            Constraint::Min(1),
+            Constraint::Length(plan_rows),
+            Constraint::Length(2),
+        ])
+        .split(area);
+
+        self.render_with_preview(chunks[0], buf);
+        if plan_rows > 0 {
+            self.render_plan_panel(chunks[1], buf);
+        }
+
+        match &self.mode {
+            Mode::Prompt(prompt) => render_prompt(prompt, chunks[2], buf),
+            _ => self.render_status_line(chunks[2], buf),
+        }
+    }
+
+    fn render_plan_panel(&self, area: Rect, buf: &mut Buffer) {
+        let hidden = self.plan.len().saturating_sub(PLAN_PANEL_ROWS);
+        let title = if hidden == 0 {
+            format!(" plan ({}) ", self.plan.len())
+        } else {
+            format!(" plan ({}, {hidden} more) ", self.plan.len())
+        };
+
+        let block = Block::default().borders(Borders::TOP).title(title);
+        let inner = block.inner(area);
+        block.render(area, buf);
+
+        for (i, staged) in self.plan.iter().take(inner.height as usize).enumerate() {
+            plan_row(staged, false, inner.width).render(row(inner, i), buf);
+        }
+    }
+
+    fn render_review(&self, area: Rect, buf: &mut Buffer) {
+        let chunks = Layout::vertical([
+            Constraint::Length(2),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+        let blocked = self
+            .plan
+            .ops()
+            .filter(|op| fs_ops::problem(op).is_some())
+            .count();
+
+        Line::styled(
+            format!(" review · {} staged", self.plan.len()),
+            Style::new().bold(),
+        )
+        .render(chunks[0], buf);
+
+        let rows = chunks[1];
+        for (i, staged) in self.plan.iter().take(rows.height as usize).enumerate() {
+            plan_row(staged, i == self.review_selected, rows.width).render(row(rows, i), buf);
+        }
+
+        let footer = if blocked == 0 {
+            Line::from(vec![
+                Span::styled("enter", Style::new().fg(Color::Green)),
+                Span::raw(" apply   "),
+                Span::raw("x drop   r rename destination   esc back"),
+            ])
+        } else {
+            Line::from(vec![
+                Span::styled(
+                    format!("{blocked} blocked"),
+                    Style::new().fg(Color::Red).bold(),
+                ),
+                Span::raw(" — cannot apply   "),
+                Span::raw("x drop   X drop all blocked   r rename destination   esc back"),
+            ])
+        };
+        footer.render(chunks[2], buf);
+    }
+
+    fn render_status_line(&self, area: Rect, buf: &mut Buffer) {
+        let block = Block::default().borders(Borders::TOP);
+        let inner = block.inner(area);
+        block.render(area, buf);
+
+        let mut spans = Vec::new();
+
+        if !self.marks.is_empty() {
+            let elsewhere = self.marks.count_outside(&self.current_dir);
+            let summary = if elsewhere == 0 {
+                format!("{} marked", self.marks.len())
+            } else {
+                format!("{} marked ({elsewhere} elsewhere)", self.marks.len())
+            };
+            spans.push(Span::styled(
+                summary,
+                Style::new().fg(Color::Magenta).bold(),
+            ));
+            spans.push(Span::raw(" · "));
+        }
+
+        if let Some(store) = LOG_STORE.get()
+            && let Some(entry) = store.latest()
+        {
+            let elapsed = store
+                .time_since_start()
+                .saturating_sub(store.elapsed_since(&entry))
+                .as_secs();
+            let age = if elapsed < 60 {
+                format!("({elapsed}s)")
+            } else {
+                format!("({}m)", elapsed / 60)
+            };
+
+            spans.push(Span::styled(
+                format!("[{}]", entry.level.as_str()),
+                Style::default().fg(level_color(entry.level)),
+            ));
+            spans.push(Span::raw(" "));
+            spans.push(Span::raw(entry.message));
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(age, Style::default().fg(Color::DarkGray)));
+        }
+
+        Line::from(spans).render(inner, buf);
     }
 
     fn render_with_preview(&mut self, area: Rect, buf: &mut Buffer) {
@@ -220,7 +757,11 @@ impl Navigator {
             } else {
                 Style::new().fg(color)
             };
-            let line = Line::styled(format!("{}  {}", icon_for(entry), entry.name), style);
+
+            let marked = self.marks.contains(&self.current_dir.join(&entry.name));
+            let mark = if marked { "●" } else { " " };
+
+            let line = Line::styled(format!("{mark} {}  {}", icon_for(entry), entry.name), style);
             line.render(row(inner, i - self.scroll_offset), buf);
         }
     }
@@ -302,6 +843,153 @@ impl Navigator {
     }
 }
 
+/// One staged operation, with whatever is wrong with it.
+///
+/// Shared by the plan panel and the review screen so a row cannot say two
+/// different things about the same operation depending on where you look.
+fn plan_row(staged: &Staged, selected: bool, width: u16) -> Line<'_> {
+    let (verb, detail) = staged.op.describe();
+    let cursor = if selected { "▸ " } else { "  " };
+
+    // A failure from the last apply outranks a problem: it is what actually happened.
+    let status = staged.failure.clone().map_or_else(
+        || fs_ops::problem(&staged.op).map(|problem| problem.to_string()),
+        Some,
+    );
+    let status = status.map(|status| format!("  ✗ {status}"));
+
+    // Paths are long and the reason a row is blocked is the part you need, so the
+    // path gives up its width rather than pushing the reason off the edge.
+    let fixed = cursor.chars().count() + 7 + status.as_ref().map_or(0, |s| s.chars().count());
+    let detail = truncate(&detail, (width as usize).saturating_sub(fixed));
+
+    let mut spans = vec![
+        Span::raw(cursor),
+        Span::styled(format!("{verb:<7}"), Style::new().fg(Color::Yellow)),
+        Span::raw(detail),
+    ];
+    if let Some(status) = status {
+        spans.push(Span::styled(status, Style::new().fg(Color::Red)));
+    }
+
+    let line = Line::from(spans);
+    if selected { line.reversed() } else { line }
+}
+
+/// Keeps the tail of `text`, which for a path is the part that identifies it.
+fn truncate(text: &str, width: usize) -> String {
+    let length = text.chars().count();
+    if length <= width {
+        return text.to_string();
+    }
+    if width <= 1 {
+        return "…".repeat(width);
+    }
+    let skipped = length - (width - 1);
+    std::iter::once('…')
+        .chain(text.chars().skip(skipped))
+        .collect()
+}
+
+/// The key map, laid out top to bottom and wrapping into as many columns as the
+/// terminal's height needs, so nothing is ever cut off.
+fn render_help(area: Rect, buf: &mut Buffer) {
+    let chunks = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .split(area);
+
+    Line::styled(" nav · keys", Style::new().bold()).render(chunks[0], buf);
+
+    let body = chunks[1];
+    let columns = help_columns(body.height as usize);
+    let count = u32::try_from(columns.len()).unwrap_or(1).max(1);
+    let areas = Layout::horizontal(vec![Constraint::Ratio(1, count); count as usize]).split(body);
+
+    for (column, area) in columns.into_iter().zip(areas.iter()) {
+        for (i, line) in column.into_iter().enumerate() {
+            line.render(row(*area, i), buf);
+        }
+    }
+
+    Line::styled(
+        " press any key to go back",
+        Style::new().fg(Color::DarkGray),
+    )
+    .render(chunks[2], buf);
+}
+
+/// Packs the sections into columns `height` rows tall.
+///
+/// A section is never split across two columns: half a group of keys stranded at
+/// the bottom of one column reads as a different group than it is.
+fn help_columns(height: usize) -> Vec<Vec<Line<'static>>> {
+    let mut columns = Vec::new();
+    let mut current: Vec<Line<'static>> = Vec::new();
+
+    for section in HELP {
+        let lines = section_lines(section);
+
+        if !current.is_empty() {
+            if current.len() + 1 + lines.len() > height {
+                columns.push(std::mem::take(&mut current));
+            } else {
+                current.push(Line::raw(""));
+            }
+        }
+        current.extend(lines);
+    }
+
+    if !current.is_empty() {
+        columns.push(current);
+    }
+    columns
+}
+
+fn section_lines(section: &HelpSection) -> Vec<Line<'static>> {
+    // One width across every section, so the columns line up with each other.
+    let key_width = HELP
+        .iter()
+        .flat_map(|section| section.keys)
+        .map(|(key, _)| key.chars().count())
+        .max()
+        .unwrap_or(0);
+
+    let title = Line::styled(
+        format!(" {}", section.title),
+        Style::new().fg(Color::Yellow).bold(),
+    );
+
+    let keys = section.keys.iter().map(|(key, what)| {
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(format!("{key:<key_width$}"), Style::new().fg(Color::Cyan)),
+            Span::raw("  "),
+            Span::raw(*what),
+        ])
+    });
+
+    std::iter::once(title).chain(keys).collect()
+}
+
+fn render_prompt(prompt: &Prompt, area: Rect, buf: &mut Buffer) {
+    let block = Block::default().borders(Borders::TOP);
+    let inner = block.inner(area);
+    block.render(area, buf);
+
+    Line::from(vec![
+        Span::styled(
+            format!("{}: ", prompt.label),
+            Style::new().fg(Color::Yellow).bold(),
+        ),
+        Span::raw(&prompt.input),
+        Span::styled("█", Style::new().fg(Color::DarkGray)),
+    ])
+    .render(inner, buf);
+}
+
 fn index_of(entries: &[DirEntry], name: &str) -> Option<usize> {
     entries.iter().position(|entry| entry.name == name)
 }
@@ -340,43 +1028,6 @@ fn render_text_preview(path: &Path, area: Rect, buf: &mut Buffer) {
     Paragraph::new(content).render(area, buf);
 }
 
-fn render_status_line(area: Rect, buf: &mut Buffer) {
-    let Some(store) = LOG_STORE.get() else {
-        return;
-    };
-
-    let Some(entry) = store.latest() else {
-        return;
-    };
-
-    let elapsed = store
-        .time_since_start()
-        .saturating_sub(store.elapsed_since(&entry));
-    let elapsed_secs = elapsed.as_secs();
-    let time_str = if elapsed_secs < 60 {
-        format!("({elapsed_secs}s)")
-    } else {
-        format!("({}m)", elapsed_secs / 60)
-    };
-
-    let block = Block::default().borders(Borders::TOP);
-    let inner = block.inner(area);
-    block.render(area, buf);
-
-    let line = Line::from(vec![
-        Span::styled(
-            format!("[{}]", entry.level.as_str()),
-            Style::default().fg(level_color(entry.level)),
-        ),
-        Span::raw(" "),
-        Span::raw(&entry.message),
-        Span::raw(" "),
-        Span::styled(time_str, Style::default().fg(Color::DarkGray)),
-    ]);
-
-    line.render(inner, buf);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,6 +1035,10 @@ mod tests {
 
     fn open(path: &Path, select: Option<&str>) -> Navigator {
         Navigator::new(path.to_str().unwrap(), select).unwrap()
+    }
+
+    fn read(path: &Path) -> String {
+        std::fs::read_to_string(path).unwrap()
     }
 
     fn render_to_string(nav: &mut Navigator, width: u16, height: u16) -> String {
@@ -617,6 +1272,601 @@ mod tests {
         nav.go_to(tmp.path().join("sub")).unwrap();
 
         assert_eq!(selected(&nav), ".");
+    }
+
+    fn press(nav: &mut Navigator, c: char) {
+        nav.handle_key(KeyEvent::from(KeyCode::Char(c))).unwrap();
+    }
+
+    fn key(nav: &mut Navigator, code: KeyCode) {
+        nav.handle_key(KeyEvent::from(code)).unwrap();
+    }
+
+    fn type_name(nav: &mut Navigator, name: &str) {
+        for c in name.chars() {
+            press(nav, c);
+        }
+    }
+
+    /// Open the review and apply, the way `enter` alone cannot: in the listing it
+    /// still means "enter this directory".
+    fn apply(nav: &mut Navigator) {
+        press(nav, 'p');
+        key(nav, KeyCode::Enter);
+    }
+
+    /// Puts the cursor on `name` and marks it.
+    fn mark(nav: &mut Navigator, name: &str) {
+        nav.selected = index_of(&nav.entries, name).unwrap_or_else(|| panic!("no {name} here"));
+        press(nav, ' ');
+    }
+
+    /// Clears a prompt that was prefilled with the current name, then types.
+    fn replace_name(nav: &mut Navigator, name: &str) {
+        for _ in 0..128 {
+            key(nav, KeyCode::Backspace);
+        }
+        type_name(nav, name);
+    }
+
+    #[test]
+    fn question_mark_shows_the_keys() {
+        let tmp = TempDir::new();
+
+        let mut nav = open(tmp.path(), None);
+        press(&mut nav, '?');
+        let out = render_to_string(&mut nav, 100, 30);
+
+        for section in HELP {
+            assert!(
+                out.contains(section.title),
+                "missing {} in:\n{out}",
+                section.title
+            );
+        }
+        assert!(out.contains("press any key to go back"), "in:\n{out}");
+    }
+
+    #[test]
+    fn every_documented_key_reaches_the_screen() {
+        let tmp = TempDir::new();
+
+        let mut nav = open(tmp.path(), None);
+        press(&mut nav, '?');
+        let out = render_to_string(&mut nav, 120, 40);
+
+        for (key, what) in HELP.iter().flat_map(|section| section.keys) {
+            assert!(out.contains(key), "key {key} was cut off in:\n{out}");
+            assert!(out.contains(what), "text for {key} was cut off in:\n{out}");
+        }
+    }
+
+    #[test]
+    fn the_keys_fit_a_short_terminal_by_using_more_columns() {
+        let tmp = TempDir::new();
+
+        let mut nav = open(tmp.path(), None);
+        press(&mut nav, '?');
+        // Far too short for one column, so it must wrap into several.
+        let out = render_to_string(&mut nav, 200, 14);
+
+        for section in HELP {
+            assert!(
+                out.contains(section.title),
+                "missing {} in:\n{out}",
+                section.title
+            );
+        }
+    }
+
+    #[test]
+    fn no_key_is_documented_twice_in_one_section() {
+        for section in HELP {
+            for (i, (key, _)) in section.keys.iter().enumerate() {
+                let duplicate = section
+                    .keys
+                    .iter()
+                    .skip(i + 1)
+                    .any(|(other, _)| other == key);
+                assert!(!duplicate, "{key} is listed twice under {}", section.title);
+            }
+        }
+    }
+
+    #[test]
+    fn any_key_dismisses_the_help() {
+        let tmp = TempDir::new();
+        tmp.file("a.txt", "");
+
+        for dismiss in ['?', 'j', 'q', 'z'] {
+            let mut nav = open(tmp.path(), None);
+            press(&mut nav, '?');
+            assert!(matches!(nav.mode, Mode::Help));
+
+            press(&mut nav, dismiss);
+            assert!(
+                matches!(nav.mode, Mode::Normal),
+                "{dismiss} should have closed the help"
+            );
+        }
+    }
+
+    #[test]
+    fn dismissing_the_help_does_not_also_run_that_key() {
+        let tmp = TempDir::new();
+        tmp.file("victim.txt", "");
+
+        let mut nav = open(tmp.path(), Some("victim.txt"));
+        press(&mut nav, '?');
+        press(&mut nav, 'd');
+
+        assert!(
+            nav.plan.is_empty(),
+            "the key that closed the help must not also stage"
+        );
+    }
+
+    #[test]
+    fn marking_leaves_the_cursor_where_it_is() {
+        let tmp = TempDir::new();
+        tmp.file("a.txt", "");
+        tmp.file("b.txt", "");
+
+        let mut nav = open(tmp.path(), Some("a.txt"));
+        press(&mut nav, ' ');
+
+        assert!(nav.marks.contains(&tmp.path().join("a.txt")));
+        assert_eq!(selected(&nav), "a.txt");
+    }
+
+    #[test]
+    fn marking_the_same_entry_again_unmarks_it() {
+        let tmp = TempDir::new();
+        tmp.file("a.txt", "");
+
+        let mut nav = open(tmp.path(), Some("a.txt"));
+        press(&mut nav, ' ');
+        press(&mut nav, ' ');
+
+        assert!(nav.marks.is_empty());
+    }
+
+    #[test]
+    fn the_navigation_shortcuts_cannot_be_marked() {
+        let tmp = TempDir::new();
+        tmp.file("a.txt", "");
+
+        let mut nav = open(tmp.path(), None);
+        assert_eq!(selected(&nav), ".");
+        press(&mut nav, ' ');
+
+        assert!(nav.marks.is_empty(), "`.` must never become a target");
+    }
+
+    #[test]
+    fn escape_clears_every_mark() {
+        let tmp = TempDir::new();
+        tmp.file("a.txt", "");
+        tmp.file("b.txt", "");
+
+        let mut nav = open(tmp.path(), Some("a.txt"));
+        mark(&mut nav, "a.txt");
+        mark(&mut nav, "b.txt");
+        assert_eq!(nav.marks.len(), 2);
+
+        key(&mut nav, KeyCode::Esc);
+
+        assert!(nav.marks.is_empty());
+    }
+
+    #[test]
+    fn staging_with_nothing_marked_uses_the_cursor() {
+        let tmp = TempDir::new();
+        tmp.file("lonely.txt", "");
+
+        let mut nav = open(tmp.path(), Some("lonely.txt"));
+        press(&mut nav, 'd');
+
+        assert_eq!(nav.plan.len(), 1);
+        assert_eq!(nav.plan.ops().next().unwrap().describe().1, "lonely.txt");
+    }
+
+    #[test]
+    fn marked_entries_are_copied_into_the_directory_you_are_standing_in() {
+        let tmp = TempDir::new();
+        tmp.file("one.txt", "first");
+        tmp.file("two.txt", "second");
+        tmp.dir("dest");
+
+        let mut nav = open(tmp.path(), Some("one.txt"));
+        mark(&mut nav, "one.txt");
+        mark(&mut nav, "two.txt");
+
+        nav.go_to(tmp.path().join("dest")).unwrap();
+        press(&mut nav, 'c');
+        apply(&mut nav);
+
+        assert_eq!(read(&tmp.path().join("dest/one.txt")), "first");
+        assert_eq!(read(&tmp.path().join("dest/two.txt")), "second");
+        assert!(
+            tmp.path().join("one.txt").exists(),
+            "copy keeps the original"
+        );
+    }
+
+    #[test]
+    fn moving_marked_entries_removes_the_originals() {
+        let tmp = TempDir::new();
+        let source = tmp.file("travelling.txt", "contents");
+        tmp.dir("dest");
+
+        let mut nav = open(tmp.path(), Some("travelling.txt"));
+        press(&mut nav, ' ');
+        nav.go_to(tmp.path().join("dest")).unwrap();
+        press(&mut nav, 'm');
+        apply(&mut nav);
+
+        assert_eq!(read(&tmp.path().join("dest/travelling.txt")), "contents");
+        assert!(!source.exists());
+    }
+
+    #[test]
+    fn marks_survive_staging_so_one_set_can_go_to_two_places() {
+        let tmp = TempDir::new();
+        tmp.file("shared.txt", "x");
+        tmp.dir("first");
+        tmp.dir("second");
+
+        let mut nav = open(tmp.path(), Some("shared.txt"));
+        press(&mut nav, ' ');
+
+        nav.go_to(tmp.path().join("first")).unwrap();
+        press(&mut nav, 'c');
+        nav.go_to(tmp.path().join("second")).unwrap();
+        press(&mut nav, 'c');
+
+        assert_eq!(nav.plan.len(), 2);
+        apply(&mut nav);
+
+        assert!(tmp.path().join("first/shared.txt").exists());
+        assert!(tmp.path().join("second/shared.txt").exists());
+    }
+
+    #[test]
+    fn applying_clears_the_marks_and_empties_the_plan() {
+        let tmp = TempDir::new();
+        tmp.file("doomed.txt", "");
+
+        let mut nav = open(tmp.path(), Some("doomed.txt"));
+        press(&mut nav, ' ');
+        press(&mut nav, 'd');
+        apply(&mut nav);
+
+        assert!(nav.marks.is_empty());
+        assert!(nav.plan.is_empty());
+        assert!(!tmp.path().join("doomed.txt").exists());
+    }
+
+    #[test]
+    fn applying_refreshes_the_listing() {
+        let tmp = TempDir::new();
+        tmp.file("doomed.txt", "");
+        tmp.file("keeper.txt", "");
+
+        let mut nav = open(tmp.path(), Some("doomed.txt"));
+        press(&mut nav, 'd');
+        apply(&mut nav);
+
+        assert!(
+            !nav.entries.iter().any(|e| e.name == "doomed.txt"),
+            "the trashed entry should be gone from the listing"
+        );
+        assert!(nav.entries.iter().any(|e| e.name == "keeper.txt"));
+    }
+
+    #[test]
+    fn a_blocked_plan_refuses_to_apply() {
+        let tmp = TempDir::new();
+        tmp.file("source.txt", "new");
+        tmp.file("dest/source.txt", "original");
+
+        let mut nav = open(tmp.path(), Some("source.txt"));
+        press(&mut nav, ' ');
+        nav.go_to(tmp.path().join("dest")).unwrap();
+        press(&mut nav, 'c');
+        apply(&mut nav);
+
+        assert_eq!(nav.plan.len(), 1, "the blocked operation must survive");
+        assert_eq!(
+            read(&tmp.path().join("dest/source.txt")),
+            "original",
+            "nothing may be clobbered"
+        );
+    }
+
+    #[test]
+    fn dropping_the_blocked_operations_lets_the_rest_through() {
+        let tmp = TempDir::new();
+        tmp.file("fresh.txt", "fresh");
+        tmp.file("clash.txt", "new");
+        tmp.file("dest/clash.txt", "original");
+
+        let mut nav = open(tmp.path(), Some("clash.txt"));
+        mark(&mut nav, "clash.txt");
+        mark(&mut nav, "fresh.txt");
+        nav.go_to(tmp.path().join("dest")).unwrap();
+        press(&mut nav, 'c');
+        assert_eq!(nav.plan.len(), 2);
+
+        press(&mut nav, 'p');
+        press(&mut nav, 'X');
+        key(&mut nav, KeyCode::Enter);
+
+        assert_eq!(read(&tmp.path().join("dest/clash.txt")), "original");
+        assert_eq!(read(&tmp.path().join("dest/fresh.txt")), "fresh");
+    }
+
+    #[test]
+    fn a_conflicting_destination_can_be_renamed_in_review() {
+        let tmp = TempDir::new();
+        tmp.file("notes.txt", "mine");
+        tmp.file("dest/notes.txt", "theirs");
+
+        let mut nav = open(tmp.path(), Some("notes.txt"));
+        press(&mut nav, ' ');
+        nav.go_to(tmp.path().join("dest")).unwrap();
+        press(&mut nav, 'c');
+
+        press(&mut nav, 'p');
+        press(&mut nav, 'r');
+        replace_name(&mut nav, "notes-mine.txt");
+        key(&mut nav, KeyCode::Enter);
+        key(&mut nav, KeyCode::Enter);
+
+        assert_eq!(read(&tmp.path().join("dest/notes.txt")), "theirs");
+        assert_eq!(read(&tmp.path().join("dest/notes-mine.txt")), "mine");
+    }
+
+    #[test]
+    fn dropping_one_operation_leaves_the_others() {
+        let tmp = TempDir::new();
+        tmp.file("a.txt", "");
+        tmp.file("b.txt", "");
+
+        let mut nav = open(tmp.path(), Some("a.txt"));
+        mark(&mut nav, "a.txt");
+        mark(&mut nav, "b.txt");
+        press(&mut nav, 'd');
+        assert_eq!(nav.plan.len(), 2);
+
+        press(&mut nav, 'p');
+        press(&mut nav, 'x');
+
+        assert_eq!(nav.plan.len(), 1);
+    }
+
+    #[test]
+    fn creating_a_file_goes_through_the_plan() {
+        let tmp = TempDir::new();
+
+        let mut nav = open(tmp.path(), None);
+        press(&mut nav, 'a');
+        type_name(&mut nav, "fresh.rs");
+        key(&mut nav, KeyCode::Enter);
+
+        assert_eq!(nav.plan.len(), 1, "nothing should happen before applying");
+        assert!(!tmp.path().join("fresh.rs").exists());
+
+        apply(&mut nav);
+
+        assert_eq!(read(&tmp.path().join("fresh.rs")), "");
+    }
+
+    #[test]
+    fn creating_a_directory_goes_through_the_plan() {
+        let tmp = TempDir::new();
+
+        let mut nav = open(tmp.path(), None);
+        press(&mut nav, 'A');
+        type_name(&mut nav, "newdir");
+        key(&mut nav, KeyCode::Enter);
+        apply(&mut nav);
+
+        assert!(tmp.path().join("newdir").is_dir());
+    }
+
+    #[test]
+    fn renaming_starts_from_the_current_name() {
+        let tmp = TempDir::new();
+        tmp.file("original.txt", "");
+
+        let mut nav = open(tmp.path(), Some("original.txt"));
+        press(&mut nav, 'r');
+
+        let Mode::Prompt(prompt) = &nav.mode else {
+            panic!("expected a prompt");
+        };
+        assert_eq!(prompt.input, "original.txt");
+    }
+
+    #[test]
+    fn renaming_applies_as_a_move() {
+        let tmp = TempDir::new();
+        let original = tmp.file("original.txt", "same bytes");
+
+        let mut nav = open(tmp.path(), Some("original.txt"));
+        press(&mut nav, 'r');
+        replace_name(&mut nav, "renamed.txt");
+        key(&mut nav, KeyCode::Enter);
+        apply(&mut nav);
+
+        assert!(!original.exists());
+        assert_eq!(read(&tmp.path().join("renamed.txt")), "same bytes");
+    }
+
+    #[test]
+    fn an_unusable_name_keeps_the_prompt_open() {
+        let tmp = TempDir::new();
+
+        let mut nav = open(tmp.path(), None);
+        press(&mut nav, 'a');
+        type_name(&mut nav, "in/valid");
+        key(&mut nav, KeyCode::Enter);
+
+        assert!(
+            matches!(nav.mode, Mode::Prompt(_)),
+            "a rejected name should not close the prompt"
+        );
+        assert!(nav.plan.is_empty());
+    }
+
+    #[test]
+    fn escape_abandons_a_prompt() {
+        let tmp = TempDir::new();
+
+        let mut nav = open(tmp.path(), None);
+        press(&mut nav, 'a');
+        type_name(&mut nav, "unwanted.txt");
+        key(&mut nav, KeyCode::Esc);
+
+        assert!(matches!(nav.mode, Mode::Normal));
+        assert!(nav.plan.is_empty());
+    }
+
+    #[test]
+    fn typing_a_name_does_not_trigger_normal_keys() {
+        let tmp = TempDir::new();
+        tmp.file("victim.txt", "");
+
+        let mut nav = open(tmp.path(), Some("victim.txt"));
+        press(&mut nav, 'a');
+        // Every one of these is a staging key in normal mode.
+        type_name(&mut nav, "dcmqp");
+        key(&mut nav, KeyCode::Enter);
+
+        assert_eq!(nav.plan.len(), 1);
+        assert_eq!(nav.plan.ops().next().unwrap().describe().1, "dcmqp");
+    }
+
+    #[test]
+    fn review_only_opens_when_something_is_staged() {
+        let tmp = TempDir::new();
+
+        let mut nav = open(tmp.path(), None);
+        press(&mut nav, 'p');
+
+        assert!(matches!(nav.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn a_source_that_vanished_after_staging_is_blocked_not_attempted() {
+        let tmp = TempDir::new();
+        let vanishing = tmp.file("vanishing.txt", "");
+
+        let mut nav = open(tmp.path(), Some("vanishing.txt"));
+        press(&mut nav, 'd');
+        // Deleted behind the navigator's back, after it was staged.
+        std::fs::remove_file(&vanishing).unwrap();
+        apply(&mut nav);
+
+        assert_eq!(nav.plan.len(), 1, "preflight should refuse the whole plan");
+        assert!(nav.plan.iter().next().unwrap().failure.is_none());
+    }
+
+    /// Stages a move into a directory, then deletes that directory. Preflight sees
+    /// a live source and a free destination, so this only fails once it runs.
+    fn stage_a_move_that_will_fail(tmp: &TempDir) -> Navigator {
+        tmp.file("mover.txt", "");
+        tmp.dir("dest");
+
+        let mut nav = open(tmp.path(), Some("mover.txt"));
+        press(&mut nav, ' ');
+        nav.go_to(tmp.path().join("dest")).unwrap();
+        press(&mut nav, 'm');
+        nav.go_to_parent_directory().unwrap();
+        key(&mut nav, KeyCode::Esc);
+
+        std::fs::remove_dir(tmp.path().join("dest")).unwrap();
+        nav
+    }
+
+    #[test]
+    fn a_failed_operation_stays_staged_with_its_reason() {
+        let tmp = TempDir::new();
+        let mut nav = stage_a_move_that_will_fail(&tmp);
+
+        apply(&mut nav);
+
+        assert_eq!(nav.plan.len(), 1);
+        assert!(
+            nav.plan.iter().next().unwrap().failure.is_some(),
+            "the reason it failed should be kept for a retry"
+        );
+    }
+
+    #[test]
+    fn one_failure_does_not_stop_the_operations_after_it() {
+        let tmp = TempDir::new();
+        tmp.file("survivor.txt", "");
+        let mut nav = stage_a_move_that_will_fail(&tmp);
+
+        // Staged after the doomed move, so it only runs if the failure is survived.
+        nav.selected = index_of(&nav.entries, "survivor.txt").unwrap();
+        press(&mut nav, 'd');
+        assert_eq!(nav.plan.len(), 2);
+
+        apply(&mut nav);
+
+        assert_eq!(nav.plan.len(), 1, "only the failure should remain");
+        assert!(
+            !tmp.path().join("survivor.txt").exists(),
+            "the operation after the failure must still have run"
+        );
+    }
+
+    #[test]
+    fn the_plan_panel_shows_staged_work() {
+        let tmp = TempDir::new();
+        tmp.file("doomed.txt", "");
+
+        let mut nav = open(tmp.path(), Some("doomed.txt"));
+        press(&mut nav, 'd');
+        let out = render_to_string(&mut nav, 80, 24);
+
+        assert!(out.contains("plan (1)"), "in:\n{out}");
+        assert!(out.contains("trash"), "in:\n{out}");
+    }
+
+    #[test]
+    fn the_review_screen_names_what_is_blocked() {
+        let tmp = TempDir::new();
+        tmp.file("clash.txt", "");
+        tmp.file("dest/clash.txt", "");
+
+        let mut nav = open(tmp.path(), Some("clash.txt"));
+        press(&mut nav, ' ');
+        nav.go_to(tmp.path().join("dest")).unwrap();
+        press(&mut nav, 'c');
+        press(&mut nav, 'p');
+        let out = render_to_string(&mut nav, 100, 24);
+
+        assert!(out.contains("review"), "in:\n{out}");
+        assert!(out.contains("1 blocked"), "in:\n{out}");
+        assert!(out.contains("destination already exists"), "in:\n{out}");
+    }
+
+    #[test]
+    fn marks_are_shown_in_the_listing_and_counted_in_the_status_line() {
+        let tmp = TempDir::new();
+        tmp.file("marked.txt", "");
+        tmp.dir("elsewhere");
+
+        let mut nav = open(tmp.path(), Some("marked.txt"));
+        press(&mut nav, ' ');
+        nav.go_to(tmp.path().join("elsewhere")).unwrap();
+        let out = render_to_string(&mut nav, 80, 24);
+
+        assert!(out.contains("1 marked (1 elsewhere)"), "in:\n{out}");
     }
 
     #[test]

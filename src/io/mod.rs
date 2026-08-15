@@ -3,8 +3,10 @@
 //! Each function takes a path and returns plain data, so the rest of the crate
 //! can render without knowing how anything was read.
 
+pub mod clipboard;
 pub mod dir;
 pub mod file;
+pub mod fs_ops;
 pub mod nvim;
 pub mod raster;
 
