@@ -4,7 +4,6 @@ pub mod log_store;
 mod globals;
 mod io;
 mod navigator;
-mod preview;
 
 use clap::Parser;
 use ratatui::DefaultTerminal;

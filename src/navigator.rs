@@ -1,6 +1,5 @@
-use std::{env, fs, path::PathBuf, process::Command};
+use std::path::{Path, PathBuf};
 
-use log::Level;
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     prelude::Buffer,
@@ -12,10 +11,13 @@ use ratatui_image::{StatefulImage, picker::Picker, protocol::StatefulProtocol};
 
 use crate::{
     error::Resultx,
-    globals::{NF_OCT_FILE_DIRECTORY_FILL, SCROLL_OFF, file_color},
-    io::dir::{DirEntry, read_dir},
+    globals::{NF_OCT_FILE_DIRECTORY_FILL, SCROLL_OFF, file_color, level_color},
+    io::{
+        FileKind,
+        dir::{self, DirEntry},
+        file, nvim, raster,
+    },
     log_store::LOG_STORE,
-    preview::{image_preview, svg_preview, text_file_preview},
 };
 
 pub struct Navigator {
@@ -31,13 +33,8 @@ pub struct Navigator {
 
 impl Navigator {
     pub fn new(current_dir_path: &str, select: Option<&str>) -> Resultx<Self> {
-        let mut current_dir = PathBuf::from(current_dir_path);
-        // Calling `parent()` on a relative path returns None, so work with canonical paths.
-        if current_dir.is_relative() {
-            current_dir = std::fs::canonicalize(current_dir)?;
-        }
-
-        let entries = read_dir(&current_dir)?;
+        let current_dir = dir::resolve(Path::new(current_dir_path))?;
+        let entries = dir::read_dir_with_dots(&current_dir)?;
         let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
 
         // Find the index of the file to select
@@ -67,9 +64,7 @@ impl Navigator {
         let name = entry.name.clone();
 
         if !entry.is_dir {
-            // File selected - open in neovim
-            let path = self.current_dir.join(&name);
-            return self.open_in_neovim(&path);
+            return nvim::open(&self.current_dir.join(&name));
         }
 
         match name.as_str() {
@@ -87,67 +82,9 @@ impl Navigator {
         Ok(false)
     }
 
-    /// Opens a file in the parent neovim instance via the NVIM socket.
-    /// Returns `Ok(true)` if successful and navigator should quit.
-    fn open_in_neovim(&self, path: &PathBuf) -> Resultx<bool> {
-        let nvim_socket = match env::var("NVIM") {
-            Ok(socket) => {
-                log::info!("NVIM socket: {}", socket);
-                socket
-            }
-            Err(e) => {
-                log::warn!(
-                    "NVIM env var not set: {} - not running inside neovim terminal",
-                    e
-                );
-                return Ok(false);
-            }
-        };
-
-        let path_str = path.to_str().unwrap_or("");
-        log::info!("Opening in neovim: {}", path_str);
-        log::info!("Running: nvim --server {} --remote-expr ...", nvim_socket);
-
-        // Use --remote-expr to:
-        // 1. Switch to the previous window (the one behind the floating terminal)
-        // 2. Open the file there
-        // This way when the floating terminal closes, the file is already visible.
-        let cmd = format!("execute('wincmd p | edit {}')", path_str.replace("'", "''"));
-        log::info!("Sending command: {}", cmd);
-
-        let output = Command::new("nvim")
-            .args(["--server", &nvim_socket, "--remote-expr", &cmd])
-            .output()?;
-
-        log::info!("Exit status: {:?}", output.status);
-
-        if !output.stdout.is_empty() {
-            log::info!("stdout: {}", String::from_utf8_lossy(&output.stdout));
-        }
-
-        if !output.stderr.is_empty() {
-            log::error!("stderr: {}", String::from_utf8_lossy(&output.stderr));
-        }
-
-        if output.status.success() {
-            log::info!("File opened in neovim");
-            Ok(true)
-        } else {
-            log::error!(
-                "Failed to open file in neovim (exit code: {:?})",
-                output.status.code()
-            );
-            Ok(false)
-        }
-    }
-
+    /// Goes up one level. At the filesystem root there is nowhere to go, so this does nothing.
     pub fn go_to_parent_directory(&mut self) -> Resultx<()> {
         if let Some(parent) = self.current_dir.parent() {
-            // This means the path was relative. Still thinking if I should support relative paths.
-            if parent == "" {
-                return Ok(());
-            }
-
             log::info!("Going to parent: {}", parent.display());
             self.go_to(parent.to_path_buf())?;
         }
@@ -156,7 +93,7 @@ impl Navigator {
 
     /// Switches to `path`, resetting the selection and any cached preview.
     fn go_to(&mut self, path: PathBuf) -> Resultx<()> {
-        self.entries = read_dir(&path)?;
+        self.entries = dir::read_dir_with_dots(&path)?;
         self.current_dir = path;
         self.selected = 0;
         self.scroll_offset = 0;
@@ -199,12 +136,6 @@ impl Navigator {
     pub fn toggle_log_panel(&mut self) {
         self.log_panel_visible = !self.log_panel_visible;
         self.log_scroll_offset = 0;
-    }
-
-    fn selected_path(&self) -> Option<PathBuf> {
-        self.entries
-            .get(self.selected)
-            .map(|e| self.current_dir.join(&e.name))
     }
 
     pub fn render(&mut self, area: Rect, buf: &mut Buffer) {
@@ -275,97 +206,67 @@ impl Navigator {
     }
 
     fn render_preview(&mut self, area: Rect, buf: &mut Buffer) {
-        let Some(path) = self.selected_path() else {
-            return;
-        };
-
         let Some(entry) = self.entries.get(self.selected) else {
             return;
         };
 
-        if entry.is_dir {
-            self.render_directory_preview(&path, area, buf);
-        } else if svg_preview::is_svg(&path) {
-            self.render_svg_preview(&path, area, buf);
-        } else if image_preview::is_image(&path) {
-            self.render_image_preview(&path, area, buf);
-        } else {
-            self.render_text_preview(&path, area, buf);
+        let path = self.current_dir.join(&entry.name);
+        match FileKind::of(&path, entry.is_dir) {
+            FileKind::Dir => self.render_directory_preview(&path, area, buf),
+            FileKind::Image => self.render_image_preview(&path, area, buf),
+            FileKind::Text => self.render_text_preview(&path, area, buf),
         }
     }
 
-    fn render_directory_preview(&self, path: &PathBuf, area: Rect, buf: &mut Buffer) {
-        let content = match fs::read_dir(path) {
-            Ok(entries) => {
-                let items: Vec<String> = entries
-                    .filter_map(|e| e.ok())
-                    .take(area.height as usize)
-                    .map(|e| {
-                        let name = e.file_name().to_string_lossy().into_owned();
-                        let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                        if is_dir {
-                            format!("{NF_OCT_FILE_DIRECTORY_FILL}  {}", name)
-                        } else {
-                            format!("   {}", name)
-                        }
-                    })
-                    .collect();
-                if items.is_empty() {
-                    "(empty directory)".to_string()
-                } else {
-                    items.join("\n")
-                }
-            }
+    fn render_directory_preview(&self, path: &Path, area: Rect, buf: &mut Buffer) {
+        let content = match dir::read_dir(path) {
+            Ok(entries) if entries.is_empty() => "(empty directory)".to_string(),
+            Ok(entries) => entries
+                .iter()
+                .take(area.height as usize)
+                .map(|entry| {
+                    let icon = if entry.is_dir {
+                        NF_OCT_FILE_DIRECTORY_FILL
+                    } else {
+                        " "
+                    };
+                    format!("{icon}  {}", entry.name)
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
             Err(_) => "(cannot read directory)".to_string(),
         };
 
         Paragraph::new(content).render(area, buf);
     }
 
-    fn render_svg_preview(&mut self, path: &PathBuf, area: Rect, buf: &mut Buffer) {
-        let needs_reload = match &self.cached_image {
-            Some((cached_path, _)) => cached_path != path,
-            None => true,
-        };
+    fn render_image_preview(&mut self, path: &Path, area: Rect, buf: &mut Buffer) {
+        let cached = self
+            .cached_image
+            .as_ref()
+            .is_some_and(|(cached, _)| cached == path);
 
-        if needs_reload {
-            if let Some(dyn_img) = svg_preview::rasterize_svg(path) {
-                let protocol = self.picker.new_resize_protocol(dyn_img);
-                self.cached_image = Some((path.clone(), protocol));
-            } else {
-                Paragraph::new("(cannot load svg)").render(area, buf);
-                return;
+        if !cached {
+            match raster::load(path) {
+                Ok(img) => {
+                    let protocol = self.picker.new_resize_protocol(img);
+                    self.cached_image = Some((path.to_path_buf(), protocol));
+                }
+                Err(e) => {
+                    log::warn!("{e}");
+                    Paragraph::new("(cannot load image)").render(area, buf);
+                    return;
+                }
             }
         }
 
-        if let Some((_, ref mut protocol)) = self.cached_image {
+        if let Some((_, protocol)) = &mut self.cached_image {
             StatefulImage::default().render(area, buf, protocol);
         }
     }
 
-    fn render_image_preview(&mut self, path: &PathBuf, area: Rect, buf: &mut Buffer) {
-        let needs_reload = match &self.cached_image {
-            Some((cached_path, _)) => cached_path != path,
-            None => true,
-        };
-
-        if needs_reload {
-            if let Ok(dyn_img) = image::open(path) {
-                let protocol = self.picker.new_resize_protocol(dyn_img);
-                self.cached_image = Some((path.clone(), protocol));
-            } else {
-                Paragraph::new("(cannot load image)").render(area, buf);
-                return;
-            }
-        }
-
-        if let Some((_, ref mut protocol)) = self.cached_image {
-            StatefulImage::default().render(area, buf, protocol);
-        }
-    }
-
-    fn render_text_preview(&self, path: &PathBuf, area: Rect, buf: &mut Buffer) {
-        let content = text_file_preview::read_text_file_preview(path, area.height as usize);
+    fn render_text_preview(&self, path: &Path, area: Rect, buf: &mut Buffer) {
+        let content = file::read_text_preview(path, area.height as usize);
         Paragraph::new(content).render(area, buf);
     }
 
@@ -386,14 +287,6 @@ impl Navigator {
             format!("({}m)", elapsed_secs / 60)
         };
 
-        let level_color = match entry.level {
-            Level::Error => Color::Red,
-            Level::Warn => Color::Yellow,
-            Level::Info => Color::Green,
-            Level::Debug => Color::Blue,
-            Level::Trace => Color::Gray,
-        };
-
         let block = Block::default().borders(Borders::TOP);
         let inner = block.inner(area);
         block.render(area, buf);
@@ -401,7 +294,7 @@ impl Navigator {
         let line = Line::from(vec![
             Span::styled(
                 format!("[{}]", entry.level.as_str()),
-                Style::default().fg(level_color),
+                Style::default().fg(level_color(entry.level)),
             ),
             Span::raw(" "),
             Span::raw(&entry.message),
@@ -443,18 +336,10 @@ impl Navigator {
         {
             let y = (visible_height - 1 - i) as i32;
 
-            let level_color = match entry.level {
-                Level::Error => Color::Red,
-                Level::Warn => Color::Yellow,
-                Level::Info => Color::Green,
-                Level::Debug => Color::Blue,
-                Level::Trace => Color::Gray,
-            };
-
             let line = Line::from(vec![
                 Span::styled(
                     format!("[{}]", entry.level.as_str()),
-                    Style::default().fg(level_color),
+                    Style::default().fg(level_color(entry.level)),
                 ),
                 Span::raw(" "),
                 Span::raw(&entry.message),
@@ -468,6 +353,11 @@ impl Navigator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::io::testdir::TempDir;
+
+    fn open(path: &Path, select: Option<&str>) -> Navigator {
+        Navigator::new(path.to_str().unwrap(), select).unwrap()
+    }
 
     fn render_to_string(nav: &mut Navigator, width: u16, height: u16) -> String {
         let area = Rect::new(0, 0, width, height);
@@ -479,25 +369,180 @@ mod tests {
             .join("\n")
     }
 
-    #[test]
-    fn renders_directory_listing() {
-        let mut nav = Navigator::new("src", None).unwrap();
-        let out = render_to_string(&mut nav, 80, 24);
-        assert!(out.contains("navigator.rs"), "missing entry in:\n{out}");
-        assert!(out.contains("preview"), "missing subdir in:\n{out}");
+    /// The name under the cursor.
+    fn selected(nav: &Navigator) -> &str {
+        &nav.entries[nav.selected].name
     }
 
     #[test]
-    fn dot_dot_goes_up_without_appending_to_the_path() {
-        let mut nav = Navigator::new("src", None).unwrap();
-        let start = nav.current_dir.clone();
+    fn renders_the_listing_and_the_preview_side_by_side() {
+        let tmp = TempDir::new();
+        tmp.dir("subdir");
+        tmp.file("notes.txt", "the file contents");
 
-        // `..` is the second entry, after `.`.
-        nav.selected = 1;
-        assert_eq!(nav.entries[nav.selected].name, "..");
+        let mut nav = open(tmp.path(), Some("notes.txt"));
+        let out = render_to_string(&mut nav, 80, 24);
+
+        assert!(out.contains("subdir"), "missing directory in:\n{out}");
+        assert!(out.contains("notes.txt"), "missing file in:\n{out}");
+        assert!(
+            out.contains("the file contents"),
+            "missing preview in:\n{out}"
+        );
+    }
+
+    #[test]
+    fn starts_on_the_selected_file() {
+        let tmp = TempDir::new();
+        tmp.file("aaa.txt", "");
+        tmp.file("zzz.txt", "");
+
+        let nav = open(tmp.path(), Some("zzz.txt"));
+
+        assert_eq!(selected(&nav), "zzz.txt");
+    }
+
+    #[test]
+    fn starts_at_the_top_when_the_selection_is_missing() {
+        let tmp = TempDir::new();
+        tmp.file("aaa.txt", "");
+
+        let nav = open(tmp.path(), Some("not-here.txt"));
+
+        assert_eq!(selected(&nav), ".");
+    }
+
+    #[test]
+    fn opening_a_missing_directory_fails() {
+        let tmp = TempDir::new();
+
+        assert!(Navigator::new(tmp.path().join("nope").to_str().unwrap(), None).is_err());
+    }
+
+    #[test]
+    fn entering_a_subdirectory_descends_into_it() {
+        let tmp = TempDir::new();
+        tmp.file("sub/inside.txt", "");
+
+        let mut nav = open(tmp.path(), Some("sub"));
         nav.enter_selected().unwrap();
 
-        assert_eq!(nav.current_dir, start.parent().unwrap());
-        assert!(nav.entries.iter().any(|e| e.name == "Cargo.toml"));
+        assert_eq!(nav.current_dir, tmp.path().join("sub"));
+        assert_eq!(selected(&nav), ".");
+        assert!(nav.entries.iter().any(|e| e.name == "inside.txt"));
+    }
+
+    #[test]
+    fn entering_dot_dot_goes_up_instead_of_appending_to_the_path() {
+        let tmp = TempDir::new();
+        tmp.dir("sub");
+        tmp.file("marker.txt", "");
+
+        let mut nav = open(&tmp.path().join("sub"), None);
+        nav.selected = 1;
+        assert_eq!(selected(&nav), "..");
+        nav.enter_selected().unwrap();
+
+        assert_eq!(nav.current_dir, tmp.path());
+        assert!(nav.entries.iter().any(|e| e.name == "marker.txt"));
+    }
+
+    #[test]
+    fn entering_dot_stays_put() {
+        let tmp = TempDir::new();
+        tmp.dir("sub");
+
+        let mut nav = open(tmp.path(), None);
+        assert_eq!(selected(&nav), ".");
+        nav.enter_selected().unwrap();
+
+        assert_eq!(nav.current_dir, tmp.path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn entering_a_symlinked_directory_descends_into_it() {
+        let tmp = TempDir::new();
+        let target = tmp.dir("real");
+        tmp.file("real/inside.txt", "");
+        std::os::unix::fs::symlink(&target, tmp.path().join("link")).unwrap();
+
+        let mut nav = open(tmp.path(), Some("link"));
+        nav.enter_selected().unwrap();
+
+        assert!(nav.entries.iter().any(|e| e.name == "inside.txt"));
+    }
+
+    #[test]
+    fn moving_stops_at_both_ends_of_the_list() {
+        let tmp = TempDir::new();
+        tmp.file("a.txt", "");
+        tmp.file("b.txt", "");
+
+        let mut nav = open(tmp.path(), None);
+
+        nav.move_down_by(999);
+        assert_eq!(selected(&nav), "b.txt");
+
+        nav.move_up_by(999);
+        assert_eq!(selected(&nav), ".");
+    }
+
+    #[test]
+    fn navigating_away_drops_the_cached_preview() {
+        let tmp = TempDir::new();
+        tmp.dir("sub");
+        tmp.file("a.txt", "");
+
+        let mut nav = open(tmp.path(), Some("sub"));
+        nav.cached_image = None;
+        nav.enter_selected().unwrap();
+
+        assert!(nav.cached_image.is_none());
+        assert_eq!(nav.scroll_offset, 0);
+    }
+
+    #[test]
+    fn an_empty_directory_still_lists_the_dots() {
+        let tmp = TempDir::new();
+
+        let mut nav = open(tmp.path(), None);
+        let out = render_to_string(&mut nav, 40, 10);
+
+        assert_eq!(nav.entries.len(), 2);
+        assert!(out.contains('.'), "missing dot entries in:\n{out}");
+    }
+
+    #[test]
+    fn a_directory_preview_lists_its_contents() {
+        let tmp = TempDir::new();
+        tmp.file("sub/nested.txt", "");
+
+        let mut nav = open(tmp.path(), Some("sub"));
+        let out = render_to_string(&mut nav, 80, 24);
+
+        assert!(out.contains("nested.txt"), "missing preview in:\n{out}");
+    }
+
+    #[test]
+    fn a_binary_file_preview_says_so() {
+        let tmp = TempDir::new();
+        tmp.file("app.bin", [0x00, 0x01, 0x02, 0x03]);
+
+        let mut nav = open(tmp.path(), Some("app.bin"));
+        let out = render_to_string(&mut nav, 80, 24);
+
+        assert!(out.contains("(binary file)"), "in:\n{out}");
+    }
+
+    #[test]
+    fn a_broken_image_preview_says_so() {
+        let tmp = TempDir::new();
+        tmp.file("broken.png", "not actually a png");
+
+        let mut nav = open(tmp.path(), Some("broken.png"));
+        let out = render_to_string(&mut nav, 80, 24);
+
+        assert!(out.contains("(cannot load image)"), "in:\n{out}");
     }
 }
