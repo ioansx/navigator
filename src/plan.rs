@@ -44,17 +44,23 @@ impl Op {
         None
     }
 
-    /// The verb shown in the plan, and the detail beside it.
-    pub fn describe(&self) -> (&'static str, String) {
-        match self {
-            Self::CreateFile(path) => ("create", name_of(path)),
-            Self::CreateDir(path) => ("mkdir", name_of(path)),
-            Self::Trash(path) => ("trash", name_of(path)),
-            Self::Copy { from, to } => ("copy", format!("{} → {}", name_of(from), to.display())),
+    /// How this operation reads, in parts a row can shorten independently.
+    pub fn describe(&self) -> Described {
+        let (verb, subject, destination) = match self {
+            Self::CreateFile(path) => ("create", name_of(path), None),
+            Self::CreateDir(path) => ("mkdir", name_of(path), None),
+            Self::Trash(path) => ("trash", name_of(path), None),
             Self::Move { from, to } if from.parent() == to.parent() => {
-                ("rename", format!("{} → {}", name_of(from), name_of(to)))
+                ("rename", name_of(from), Some(name_of(to)))
             }
-            Self::Move { from, to } => ("move", format!("{} → {}", name_of(from), to.display())),
+            Self::Copy { from, to } => ("copy", name_of(from), Some(to.display().to_string())),
+            Self::Move { from, to } => ("move", name_of(from), Some(to.display().to_string())),
+        };
+
+        Described {
+            verb,
+            subject,
+            destination,
         }
     }
 
@@ -91,6 +97,14 @@ impl Op {
             .to_path_buf();
         *retargeted = parent.join(name);
     }
+}
+
+/// A staged operation split up, so a narrow row can shorten the long path
+/// without losing the name of the thing being acted on.
+pub struct Described {
+    pub verb: &'static str,
+    pub subject: String,
+    pub destination: Option<String>,
 }
 
 fn name_of(path: &Path) -> String {
@@ -262,17 +276,20 @@ mod tests {
 
     #[test]
     fn a_move_within_one_directory_reads_as_a_rename() {
-        let (verb, detail) = mv("/a/old.txt", "/a/new.txt").describe();
+        let described = mv("/a/old.txt", "/a/new.txt").describe();
 
-        assert_eq!(verb, "rename");
-        assert_eq!(detail, "old.txt → new.txt");
+        assert_eq!(described.verb, "rename");
+        assert_eq!(described.subject, "old.txt");
+        assert_eq!(described.destination.as_deref(), Some("new.txt"));
     }
 
     #[test]
     fn a_move_between_directories_reads_as_a_move() {
-        let (verb, _) = mv("/a/x.txt", "/b/x.txt").describe();
+        let described = mv("/a/x.txt", "/b/x.txt").describe();
 
-        assert_eq!(verb, "move");
+        assert_eq!(described.verb, "move");
+        assert_eq!(described.subject, "x.txt");
+        assert_eq!(described.destination.as_deref(), Some("/b/x.txt"));
     }
 
     #[test]
@@ -284,7 +301,7 @@ mod tests {
             copy("/a/x", "/b/x"),
         ]
         .iter()
-        .map(|op| op.describe().0)
+        .map(|op| op.describe().verb)
         .collect();
 
         assert_eq!(verbs, ["create", "mkdir", "trash", "copy"]);
@@ -341,7 +358,7 @@ mod tests {
         plan.push(Op::Trash(p("/a/first")));
         plan.push(Op::Trash(p("/a/second")));
 
-        let names: Vec<_> = plan.ops().map(|op| op.describe().1).collect();
+        let names: Vec<_> = plan.ops().map(|op| op.describe().subject).collect();
 
         assert_eq!(names, ["first", "second"]);
         assert_eq!(plan.len(), 2);
@@ -354,7 +371,7 @@ mod tests {
         plan.push(Op::Trash(p("/a/second")));
         plan.remove(0);
 
-        let names: Vec<_> = plan.ops().map(|op| op.describe().1).collect();
+        let names: Vec<_> = plan.ops().map(|op| op.describe().subject).collect();
 
         assert_eq!(names, ["second"]);
     }

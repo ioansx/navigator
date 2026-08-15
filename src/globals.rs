@@ -7,6 +7,18 @@ pub const SCROLL_OFF: usize = 8;
 // Nerd Font icons
 pub const NF_OCT_FILE_DIRECTORY_FILL: &str = "\u{f07b}";
 
+/// Borders, separators, hints — everything that should recede.
+pub const DIM: Color = Color::DarkGray;
+/// Where you are: the cursor bar, and the prompt you are typing at.
+pub const ACCENT: Color = Color::Cyan;
+/// Entries you have marked.
+pub const MARK: Color = Color::Magenta;
+
+/// The bar drawn beside the row under the cursor.
+pub const CURSOR_BAR: &str = "▍";
+/// The dot beside a marked entry.
+pub const MARK_DOT: &str = "●";
+
 /// Colors come from the terminal's own 16-color palette rather than fixed RGB
 /// values, so `nav` follows whatever theme the emulator is set to.
 pub fn file_color(name: &str, is_dir: bool) -> Color {
@@ -84,6 +96,15 @@ mod tests {
                 level_color(level),
                 Color::Rgb(..) | Color::Indexed(_)
             ));
+        }
+    }
+
+    #[test]
+    fn the_chrome_follows_the_terminal_theme_too() {
+        // Borders, the cursor bar and the mark dot are ANSI slots, not fixed values,
+        // so they re-colour with the emulator's theme like everything else.
+        for color in [DIM, ACCENT, MARK] {
+            assert!(!matches!(color, Color::Rgb(..) | Color::Indexed(_)));
         }
     }
 

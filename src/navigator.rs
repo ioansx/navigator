@@ -2,9 +2,9 @@ use std::path::{Path, PathBuf};
 
 use ratatui::{
     crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
-    layout::{Constraint, Layout, Offset, Rect},
+    layout::{Constraint, Layout, Margin, Offset, Rect},
     prelude::Buffer,
-    style::{Color, Style, Stylize},
+    style::{Color, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, StatefulWidget, Widget},
 };
@@ -12,13 +12,16 @@ use ratatui_image::{StatefulImage, picker::Picker, protocol::StatefulProtocol};
 
 use crate::{
     error::Resultx,
-    globals::{NF_OCT_FILE_DIRECTORY_FILL, SCROLL_JUMP, SCROLL_OFF, file_color, level_color},
+    globals::{
+        ACCENT, CURSOR_BAR, DIM, MARK, MARK_DOT, NF_OCT_FILE_DIRECTORY_FILL, SCROLL_JUMP,
+        SCROLL_OFF, file_color, level_color,
+    },
     io::{
         FileKind, clipboard,
         dir::{self, DirEntry},
         file, fs_ops, nvim, raster,
     },
-    log_store::LOG_STORE,
+    log_store::{LOG_STORE, LogEntry},
     marks::Marks,
     memory::Memory,
     plan::{Op, Plan, Staged, validate_name},
@@ -618,7 +621,10 @@ impl Navigator {
             format!(" plan ({}, {hidden} more) ", self.plan.len())
         };
 
-        let block = Block::default().borders(Borders::TOP).title(title);
+        let block = Block::default()
+            .borders(Borders::TOP)
+            .border_style(Style::new().fg(DIM))
+            .title(Line::styled(title, Style::new().fg(DIM)));
         let inner = block.inner(area);
         block.render(area, buf);
 
@@ -641,10 +647,13 @@ impl Navigator {
             .filter(|op| fs_ops::problem(op).is_some())
             .count();
 
-        Line::styled(
-            format!(" review · {} staged", self.plan.len()),
-            Style::new().bold(),
-        )
+        Line::from(vec![
+            Span::styled(" review", Style::new().fg(ACCENT).bold()),
+            Span::styled(
+                format!("  ·  {} staged", self.plan.len()),
+                Style::new().fg(DIM),
+            ),
+        ])
         .render(chunks[0], buf);
 
         let rows = chunks[1];
@@ -652,29 +661,37 @@ impl Navigator {
             plan_row(staged, i == self.review_selected, rows.width).render(row(rows, i), buf);
         }
 
-        let footer = if blocked == 0 {
-            Line::from(vec![
-                Span::styled("enter", Style::new().fg(Color::Green)),
-                Span::raw(" apply   "),
-                Span::raw("x drop   r rename destination   esc back"),
-            ])
-        } else {
-            Line::from(vec![
-                Span::styled(
-                    format!("{blocked} blocked"),
-                    Style::new().fg(Color::Red).bold(),
-                ),
-                Span::raw(" — cannot apply   "),
-                Span::raw("x drop   X drop all blocked   r rename destination   esc back"),
-            ])
-        };
-        footer.render(chunks[2], buf);
+        let mut footer = vec![Span::raw(" ")];
+        if blocked > 0 {
+            footer.push(Span::styled(
+                format!("{blocked} blocked"),
+                Style::new().fg(Color::Red).bold(),
+            ));
+            footer.push(Span::styled("  ·  ", Style::new().fg(DIM)));
+        }
+        footer.extend(hints(&[
+            ("enter", "apply"),
+            ("x", "drop"),
+            ("X", "drop blocked"),
+            ("r", "rename"),
+            ("esc", "back"),
+        ]));
+        Line::from(footer).render(chunks[2], buf);
     }
 
     fn render_status_line(&self, area: Rect, buf: &mut Buffer) {
         let block = Block::default().borders(Borders::TOP);
         let inner = block.inner(area);
         block.render(area, buf);
+
+        let latest = LOG_STORE.get().and_then(|store| {
+            let entry = store.latest()?;
+            let age = store
+                .time_since_start()
+                .saturating_sub(store.elapsed_since(&entry))
+                .as_secs();
+            Some((entry, age))
+        });
 
         let mut spans = Vec::new();
 
@@ -685,34 +702,21 @@ impl Navigator {
             } else {
                 format!("{} marked ({elsewhere} elsewhere)", self.marks.len())
             };
-            spans.push(Span::styled(
-                summary,
-                Style::new().fg(Color::Magenta).bold(),
-            ));
-            spans.push(Span::raw(" · "));
+            spans.push(Span::styled(summary, Style::new().fg(MARK).bold()));
+            if latest.is_some() {
+                spans.push(Span::styled("  ·  ", Style::new().fg(DIM)));
+            }
         }
 
-        if let Some(store) = LOG_STORE.get()
-            && let Some(entry) = store.latest()
-        {
-            let elapsed = store
-                .time_since_start()
-                .saturating_sub(store.elapsed_since(&entry))
-                .as_secs();
-            let age = if elapsed < 60 {
-                format!("({elapsed}s)")
+        if let Some((entry, seconds)) = latest {
+            let age = if seconds < 60 {
+                format!("{seconds}s")
             } else {
-                format!("({}m)", elapsed / 60)
+                format!("{}m", seconds / 60)
             };
 
-            spans.push(Span::styled(
-                format!("[{}]", entry.level.as_str()),
-                Style::default().fg(level_color(entry.level)),
-            ));
-            spans.push(Span::raw(" "));
-            spans.push(Span::raw(entry.message));
-            spans.push(Span::raw(" "));
-            spans.push(Span::styled(age, Style::default().fg(Color::DarkGray)));
+            spans.extend(log_spans(&entry));
+            spans.push(Span::styled(format!("  {age}"), Style::new().fg(DIM)));
         }
 
         Line::from(spans).render(inner, buf);
@@ -723,13 +727,15 @@ impl Navigator {
             .split(area);
 
         self.render_file_list(chunks[0], buf);
-        self.render_preview(chunks[1], buf);
+        // A column of air either side, so the preview does not touch the divider.
+        self.render_preview(chunks[1].inner(Margin::new(1, 0)), buf);
     }
 
     fn render_file_list(&mut self, area: Rect, buf: &mut Buffer) {
         let block = Block::default()
             .borders(Borders::RIGHT)
-            .title(format!(" {} ", self.current_dir.display()));
+            .border_style(Style::new().fg(DIM))
+            .title(path_title(&self.current_dir, area.width));
 
         let inner = block.inner(area);
         block.render(area, buf);
@@ -752,16 +758,26 @@ impl Navigator {
             .take(visible_height)
         {
             let color = file_color(&entry.name, entry.is_dir);
-            let style = if i == self.selected {
-                Style::new().fg(color).reversed()
+            let under_cursor = i == self.selected;
+            let marked = self.marks.contains(&self.current_dir.join(&entry.name));
+
+            let name = if under_cursor {
+                Style::new().fg(color).bold()
             } else {
                 Style::new().fg(color)
             };
 
-            let marked = self.marks.contains(&self.current_dir.join(&entry.name));
-            let mark = if marked { "●" } else { " " };
-
-            let line = Line::styled(format!("{mark} {}  {}", icon_for(entry), entry.name), style);
+            let line = Line::from(vec![
+                Span::styled(
+                    if under_cursor { CURSOR_BAR } else { " " },
+                    Style::new().fg(ACCENT),
+                ),
+                Span::styled(if marked { MARK_DOT } else { " " }, Style::new().fg(MARK)),
+                Span::raw(" "),
+                Span::styled(icon_for(entry), Style::new().fg(color)),
+                Span::raw(" "),
+                Span::styled(entry.name.clone(), name),
+            ]);
             line.render(row(inner, i - self.scroll_offset), buf);
         }
     }
@@ -793,7 +809,7 @@ impl Navigator {
                 }
                 Err(e) => {
                     log::warn!("{e}");
-                    Paragraph::new("(cannot load image)").render(area, buf);
+                    preview_text("(cannot load image)".to_string()).render(area, buf);
                     return;
                 }
             }
@@ -805,7 +821,9 @@ impl Navigator {
     }
 
     fn render_log_panel(&mut self, area: Rect, buf: &mut Buffer) {
-        let block = Block::default().borders(Borders::TOP);
+        let block = Block::default()
+            .borders(Borders::TOP)
+            .border_style(Style::new().fg(DIM));
         let inner = block.inner(area);
         block.render(area, buf);
 
@@ -829,16 +847,7 @@ impl Navigator {
             .take(visible_height)
             .enumerate()
         {
-            let line = Line::from(vec![
-                Span::styled(
-                    format!("[{}]", entry.level.as_str()),
-                    Style::default().fg(level_color(entry.level)),
-                ),
-                Span::raw(" "),
-                Span::raw(&entry.message),
-            ]);
-
-            line.render(row(inner, visible_height - 1 - i), buf);
+            Line::from(log_spans(entry)).render(row(inner, visible_height - 1 - i), buf);
         }
     }
 }
@@ -848,8 +857,8 @@ impl Navigator {
 /// Shared by the plan panel and the review screen so a row cannot say two
 /// different things about the same operation depending on where you look.
 fn plan_row(staged: &Staged, selected: bool, width: u16) -> Line<'_> {
-    let (verb, detail) = staged.op.describe();
-    let cursor = if selected { "▸ " } else { "  " };
+    let described = staged.op.describe();
+    let cursor = if selected { CURSOR_BAR } else { " " };
 
     // A failure from the last apply outranks a problem: it is what actually happened.
     let status = staged.failure.clone().map_or_else(
@@ -858,22 +867,35 @@ fn plan_row(staged: &Staged, selected: bool, width: u16) -> Line<'_> {
     );
     let status = status.map(|status| format!("  ✗ {status}"));
 
-    // Paths are long and the reason a row is blocked is the part you need, so the
-    // path gives up its width rather than pushing the reason off the edge.
-    let fixed = cursor.chars().count() + 7 + status.as_ref().map_or(0, |s| s.chars().count());
-    let detail = truncate(&detail, (width as usize).saturating_sub(fixed));
-
     let mut spans = vec![
-        Span::raw(cursor),
-        Span::styled(format!("{verb:<7}"), Style::new().fg(Color::Yellow)),
-        Span::raw(detail),
+        Span::styled(cursor, Style::new().fg(ACCENT)),
+        Span::raw(" "),
+        Span::styled(
+            format!("{:<7}", described.verb),
+            Style::new().fg(Color::Yellow),
+        ),
+        Span::raw(described.subject.clone()),
     ];
+
+    // The name being acted on and the reason a row is blocked both stay whole;
+    // the destination path is the only part with width to give up.
+    if let Some(destination) = described.destination {
+        let spent = 2
+            + 7
+            + described.subject.chars().count()
+            + 3
+            + status.as_ref().map_or(0, |s| s.chars().count());
+        let room = (width as usize).saturating_sub(spent);
+
+        spans.push(Span::styled(" → ", Style::new().fg(DIM)));
+        spans.push(Span::raw(truncate(&shorten_home(&destination), room)));
+    }
+
     if let Some(status) = status {
         spans.push(Span::styled(status, Style::new().fg(Color::Red)));
     }
 
-    let line = Line::from(spans);
-    if selected { line.reversed() } else { line }
+    Line::from(spans)
 }
 
 /// Keeps the tail of `text`, which for a path is the part that identifies it.
@@ -901,7 +923,11 @@ fn render_help(area: Rect, buf: &mut Buffer) {
     ])
     .split(area);
 
-    Line::styled(" nav · keys", Style::new().bold()).render(chunks[0], buf);
+    Line::from(vec![
+        Span::styled(" nav", Style::new().fg(ACCENT).bold()),
+        Span::styled("  ·  keys", Style::new().fg(DIM)),
+    ])
+    .render(chunks[0], buf);
 
     let body = chunks[1];
     let columns = help_columns(body.height as usize);
@@ -914,11 +940,7 @@ fn render_help(area: Rect, buf: &mut Buffer) {
         }
     }
 
-    Line::styled(
-        " press any key to go back",
-        Style::new().fg(Color::DarkGray),
-    )
-    .render(chunks[2], buf);
+    Line::styled(" press any key to go back", Style::new().fg(DIM)).render(chunks[2], buf);
 }
 
 /// Packs the sections into columns `height` rows tall.
@@ -965,7 +987,7 @@ fn section_lines(section: &HelpSection) -> Vec<Line<'static>> {
     let keys = section.keys.iter().map(|(key, what)| {
         Line::from(vec![
             Span::raw("  "),
-            Span::styled(format!("{key:<key_width$}"), Style::new().fg(Color::Cyan)),
+            Span::styled(format!("{key:<key_width$}"), Style::new().fg(ACCENT)),
             Span::raw("  "),
             Span::raw(*what),
         ])
@@ -975,19 +997,84 @@ fn section_lines(section: &HelpSection) -> Vec<Line<'static>> {
 }
 
 fn render_prompt(prompt: &Prompt, area: Rect, buf: &mut Buffer) {
-    let block = Block::default().borders(Borders::TOP);
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(Style::new().fg(DIM));
     let inner = block.inner(area);
     block.render(area, buf);
 
     Line::from(vec![
-        Span::styled(
-            format!("{}: ", prompt.label),
-            Style::new().fg(Color::Yellow).bold(),
-        ),
+        Span::styled(prompt.label, Style::new().fg(DIM)),
+        Span::styled(" › ", Style::new().fg(ACCENT).bold()),
         Span::raw(&prompt.input),
-        Span::styled("█", Style::new().fg(Color::DarkGray)),
+        Span::styled("▏", Style::new().fg(ACCENT)),
     ])
     .render(inner, buf);
+}
+
+/// The directory being viewed, with `$HOME` shortened and everything above the
+/// last component dimmed, so the name of the directory you are in is what reads.
+fn path_title(dir: &Path, width: u16) -> Line<'static> {
+    let shown = shorten_home(&dir.to_string_lossy());
+    // Keeping the tail matters: the directory you are in is the last component.
+    let shown = truncate(&shown, (width as usize).saturating_sub(2));
+    let split = shown.rfind('/').map_or(0, |at| at + 1);
+
+    Line::from(vec![
+        Span::raw(" "),
+        Span::styled(shown[..split].to_string(), Style::new().fg(DIM)),
+        Span::styled(shown[split..].to_string(), Style::new().bold()),
+        Span::raw(" "),
+    ])
+}
+
+fn shorten_home(path: &str) -> String {
+    let Some(home) = std::env::var_os("HOME") else {
+        return path.to_string();
+    };
+
+    let home = home.to_string_lossy();
+    match path.strip_prefix(home.as_ref()) {
+        // A whole component only: `/home/ioannis` must not become `~nis`.
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => format!("~{rest}"),
+        _ => path.to_string(),
+    }
+}
+
+/// A log entry as a coloured dot and its message, shared by the status line and
+/// the log panel so one cannot drift from the other.
+fn log_spans(entry: &LogEntry) -> Vec<Span<'static>> {
+    vec![
+        Span::styled("●", Style::new().fg(level_color(entry.level))),
+        Span::raw(" "),
+        Span::raw(entry.message.clone()),
+    ]
+}
+
+/// `key description` pairs for a footer, keys picked out and the rest receding.
+fn hints(pairs: &[(&'static str, &'static str)]) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for (key, what) in pairs {
+        if !spans.is_empty() {
+            spans.push(Span::raw("   "));
+        }
+        spans.push(Span::styled(*key, Style::new().fg(ACCENT)));
+        spans.push(Span::styled(format!(" {what}"), Style::new().fg(DIM)));
+    }
+    spans
+}
+
+/// Preview content, with the "(cannot read file)" stand-ins dimmed so they do not
+/// read as the file's own first line.
+fn preview_text(content: String) -> Paragraph<'static> {
+    let placeholder = content.starts_with('(') && content.ends_with(')') && !content.contains('\n');
+
+    let style = if placeholder {
+        Style::new().fg(DIM).italic()
+    } else {
+        Style::new()
+    };
+    Paragraph::new(content).style(style)
 }
 
 fn index_of(entries: &[DirEntry], name: &str) -> Option<usize> {
@@ -1020,12 +1107,12 @@ fn render_directory_preview(path: &Path, area: Rect, buf: &mut Buffer) {
         Err(_) => "(cannot read directory)".to_string(),
     };
 
-    Paragraph::new(content).render(area, buf);
+    preview_text(content).render(area, buf);
 }
 
 fn render_text_preview(path: &Path, area: Rect, buf: &mut Buffer) {
     let content = file::read_text_preview(path, area.height as usize);
-    Paragraph::new(content).render(area, buf);
+    preview_text(content).render(area, buf);
 }
 
 #[cfg(test)]
@@ -1468,7 +1555,10 @@ mod tests {
         press(&mut nav, 'd');
 
         assert_eq!(nav.plan.len(), 1);
-        assert_eq!(nav.plan.ops().next().unwrap().describe().1, "lonely.txt");
+        assert_eq!(
+            nav.plan.ops().next().unwrap().describe().subject,
+            "lonely.txt"
+        );
     }
 
     #[test]
@@ -1745,7 +1835,7 @@ mod tests {
         key(&mut nav, KeyCode::Enter);
 
         assert_eq!(nav.plan.len(), 1);
-        assert_eq!(nav.plan.ops().next().unwrap().describe().1, "dcmqp");
+        assert_eq!(nav.plan.ops().next().unwrap().describe().subject, "dcmqp");
     }
 
     #[test]
