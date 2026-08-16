@@ -9,6 +9,7 @@ pub mod file;
 pub mod fs_ops;
 pub mod nvim;
 pub mod raster;
+pub mod zoxide;
 
 #[cfg(test)]
 pub mod testdir;

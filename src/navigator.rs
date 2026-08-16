@@ -19,7 +19,7 @@ use crate::{
     io::{
         FileKind, clipboard,
         dir::{self, DirEntry},
-        file, fs_ops, nvim, raster,
+        file, fs_ops, nvim, raster, zoxide,
     },
     log_store::{LOG_STORE, LogEntry},
     marks::Marks,
@@ -56,6 +56,7 @@ const HELP: &[HelpSection] = &[
             ("ctrl-d/u", "jump by a screenful"),
             ("enter / l", "enter dir, or open in neovim"),
             ("- / h", "go up a level"),
+            ("z", "jump to a zoxide directory"),
             ("q", "quit"),
         ],
     },
@@ -107,6 +108,8 @@ enum PromptAction {
     Rename(PathBuf),
     /// Change where staged operation `n` writes to.
     Retarget(usize),
+    /// Go wherever zoxide ranks the typed words highest.
+    Jump,
 }
 
 pub struct Navigator {
@@ -183,6 +186,7 @@ impl Navigator {
             KeyCode::Char('k') | KeyCode::Up => self.move_up(),
             KeyCode::Enter | KeyCode::Char('l') => return self.enter_selected(),
             KeyCode::Char('-' | 'h') => self.go_to_parent_directory()?,
+            KeyCode::Char('z') => self.begin_prompt("jump to", PromptAction::Jump),
             KeyCode::Char('L') => self.toggle_log_panel(),
 
             KeyCode::Char(' ') => self.toggle_mark(),
@@ -426,6 +430,13 @@ impl Navigator {
             return;
         };
 
+        // The one prompt whose input is a search rather than a file name: it may
+        // hold slashes, and nothing on disk is ever named after it.
+        if matches!(prompt.action, PromptAction::Jump) {
+            self.jump(prompt.input.trim());
+            return;
+        }
+
         let name = prompt.input.trim().to_string();
         if let Some(problem) = validate_name(&name) {
             log::warn!("{name:?} is {problem}");
@@ -446,6 +457,27 @@ impl Navigator {
                 }
                 self.mode = Mode::Review;
             }
+            // Taken care of above: a search must not reach the name check.
+            PromptAction::Jump => {}
+        }
+    }
+
+    /// Goes wherever zoxide ranks `query` highest.
+    ///
+    /// A query it does not know, or one whose directory has since been removed,
+    /// leaves the navigator where it is with the reason on the status line.
+    fn jump(&mut self, query: &str) {
+        if query.is_empty() {
+            return;
+        }
+
+        let jumped = zoxide::query(query).and_then(|path| {
+            log::info!("Jumping to {}", path.display());
+            self.go_to(path)
+        });
+
+        if let Err(e) = jumped {
+            log::warn!("{e}");
         }
     }
 
@@ -1821,6 +1853,48 @@ mod tests {
 
         assert!(matches!(nav.mode, Mode::Normal));
         assert!(nav.plan.is_empty());
+    }
+
+    #[test]
+    fn z_asks_where_to_jump_to() {
+        let tmp = TempDir::new();
+
+        let mut nav = open(tmp.path(), None);
+        press(&mut nav, 'z');
+
+        let Mode::Prompt(prompt) = &nav.mode else {
+            panic!("z should open a prompt");
+        };
+        assert_eq!(prompt.label, "jump to");
+    }
+
+    #[test]
+    fn an_empty_jump_goes_nowhere() {
+        let tmp = TempDir::new();
+
+        let mut nav = open(tmp.path(), None);
+        let before = nav.current_dir.clone();
+        press(&mut nav, 'z');
+        key(&mut nav, KeyCode::Enter);
+
+        assert!(matches!(nav.mode, Mode::Normal));
+        assert_eq!(nav.current_dir, before);
+    }
+
+    #[test]
+    fn a_jump_zoxide_cannot_answer_leaves_you_where_you_are() {
+        let tmp = TempDir::new();
+
+        let mut nav = open(tmp.path(), None);
+        let before = nav.current_dir.clone();
+        press(&mut nav, 'z');
+        // A query is a search, not a name: the slash must reach zoxide instead of
+        // being refused as unusable. Nothing is anywhere near this one.
+        type_name(&mut nav, "nav/zoxide/no-such-place-4f3c");
+        key(&mut nav, KeyCode::Enter);
+
+        assert!(matches!(nav.mode, Mode::Normal), "the prompt should close");
+        assert_eq!(nav.current_dir, before);
     }
 
     #[test]
