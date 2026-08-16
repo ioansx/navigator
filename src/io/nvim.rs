@@ -33,14 +33,14 @@ pub fn open(path: &Path) -> Resultx<bool> {
     Ok(true)
 }
 
-/// Vimscript that opens `path` in the window behind the floating terminal, so the
-/// file is already on screen once that terminal closes.
+/// Vimscript that opens `path` in the window `nav`'s terminal occupies, so the file
+/// takes that window over the way a file explorer buffer would.
 fn edit_expr(path: &Path) -> String {
     // Doubling is how a single quote is escaped inside a Vimscript literal string,
     // and `fnameescape` handles the spaces and the `|`, `%`, `#` that `:edit` would
     // otherwise read as syntax.
     let quoted = path.to_string_lossy().replace('\'', "''");
-    format!("execute('wincmd p | edit ' . fnameescape('{quoted}'))")
+    format!("execute('edit ' . fnameescape('{quoted}'))")
 }
 
 #[cfg(test)]
@@ -53,13 +53,10 @@ mod tests {
     }
 
     #[test]
-    fn switches_windows_before_editing() {
+    fn edits_the_path_in_the_current_window() {
         let expr = expr_for("/home/me/main.rs");
 
-        assert_eq!(
-            expr,
-            "execute('wincmd p | edit ' . fnameescape('/home/me/main.rs'))"
-        );
+        assert_eq!(expr, "execute('edit ' . fnameescape('/home/me/main.rs'))");
     }
 
     #[test]
@@ -78,10 +75,7 @@ mod tests {
     fn doubles_single_quotes_so_they_do_not_end_the_string() {
         let expr = expr_for("/tmp/it's here.rs");
 
-        assert_eq!(
-            expr,
-            "execute('wincmd p | edit ' . fnameescape('/tmp/it''s here.rs'))"
-        );
+        assert_eq!(expr, "execute('edit ' . fnameescape('/tmp/it''s here.rs'))");
     }
 
     #[test]
