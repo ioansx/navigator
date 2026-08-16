@@ -13,6 +13,11 @@ pub const DIM: Color = Color::DarkGray;
 pub const ACCENT: Color = Color::Cyan;
 /// Entries you have marked.
 pub const MARK: Color = Color::Magenta;
+/// Behind the part of a name the search matched. The text on top is drawn in
+/// [`SEARCH_TEXT`] rather than the file's own color, which a yellow file would
+/// otherwise lose against.
+pub const SEARCH: Color = Color::Yellow;
+pub const SEARCH_TEXT: Color = Color::Black;
 
 /// The bar drawn beside the row under the cursor.
 pub const CURSOR_BAR: &str = "▍";
@@ -101,9 +106,10 @@ mod tests {
 
     #[test]
     fn the_chrome_follows_the_terminal_theme_too() {
-        // Borders, the cursor bar and the mark dot are ANSI slots, not fixed values,
-        // so they re-colour with the emulator's theme like everything else.
-        for color in [DIM, ACCENT, MARK] {
+        // Borders, the cursor bar, the mark dot and the search highlight are ANSI
+        // slots, not fixed values, so they re-colour with the emulator's theme like
+        // everything else.
+        for color in [DIM, ACCENT, MARK, SEARCH, SEARCH_TEXT] {
             assert!(!matches!(color, Color::Rgb(..) | Color::Indexed(_)));
         }
     }

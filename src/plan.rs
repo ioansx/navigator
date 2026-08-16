@@ -163,8 +163,18 @@ pub struct Staged {
 }
 
 impl Plan {
-    pub fn push(&mut self, op: Op) {
+    /// Stages `op` unless it is already staged, and says whether it went in.
+    ///
+    /// The same change twice over is still one change, and staging it twice does
+    /// not do it twice: whichever copy runs second finds the work already done and
+    /// fails on a destination that is now taken.
+    pub fn push(&mut self, op: Op) -> bool {
+        if self.ops().any(|staged| *staged == op) {
+            return false;
+        }
+
         self.staged.push(Staged { op, failure: None });
+        true
     }
 
     pub const fn is_empty(&self) -> bool {
@@ -181,6 +191,10 @@ impl Plan {
 
     pub fn get_mut(&mut self, index: usize) -> Option<&mut Staged> {
         self.staged.get_mut(index)
+    }
+
+    pub fn clear(&mut self) {
+        self.staged.clear();
     }
 
     pub fn remove(&mut self, index: usize) {
@@ -362,6 +376,53 @@ mod tests {
 
         assert_eq!(names, ["first", "second"]);
         assert_eq!(plan.len(), 2);
+    }
+
+    #[test]
+    fn the_same_operation_is_never_staged_twice() {
+        let mut plan = Plan::default();
+
+        assert!(plan.push(Op::Trash(p("/a/x.txt"))));
+        assert!(!plan.push(Op::Trash(p("/a/x.txt"))));
+        assert!(!plan.push(Op::Trash(p("/a/x.txt"))));
+
+        assert_eq!(plan.len(), 1);
+    }
+
+    #[test]
+    fn operations_that_only_look_alike_are_both_kept() {
+        let mut plan = Plan::default();
+
+        // One source, two destinations, and the same two paths the other way
+        // around: none of these does the work of another.
+        assert!(plan.push(copy("/a/x.txt", "/b/x.txt")));
+        assert!(plan.push(copy("/a/x.txt", "/c/x.txt")));
+        assert!(plan.push(mv("/a/x.txt", "/b/x.txt")));
+        assert!(plan.push(copy("/b/x.txt", "/a/x.txt")));
+
+        assert_eq!(plan.len(), 4);
+    }
+
+    #[test]
+    fn a_refused_duplicate_leaves_the_order_alone() {
+        let mut plan = Plan::default();
+        plan.push(Op::Trash(p("/a/first")));
+        plan.push(Op::Trash(p("/a/second")));
+        plan.push(Op::Trash(p("/a/first")));
+
+        let names: Vec<_> = plan.ops().map(|op| op.describe().subject).collect();
+
+        assert_eq!(names, ["first", "second"]);
+    }
+
+    #[test]
+    fn an_operation_can_be_staged_again_once_it_is_dropped() {
+        let mut plan = Plan::default();
+        plan.push(Op::Trash(p("/a/x.txt")));
+        plan.remove(0);
+
+        assert!(plan.push(Op::Trash(p("/a/x.txt"))));
+        assert_eq!(plan.len(), 1);
     }
 
     #[test]

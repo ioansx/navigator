@@ -2,7 +2,7 @@
 name = "navigator"
 version = "0.1.0"
 edition = "2024"
-description = "Terminal file navigator that opens files in the neovim instance around it"
+description = "Terminal file navigator"
 publish = false
 
 [[bin]]

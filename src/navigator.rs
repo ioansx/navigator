@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    ops::Range,
+    path::{Path, PathBuf},
+};
 
 use ratatui::{
     crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
@@ -14,7 +17,7 @@ use crate::{
     error::Resultx,
     globals::{
         ACCENT, CURSOR_BAR, DIM, MARK, MARK_DOT, NF_OCT_FILE_DIRECTORY_FILL, SCROLL_JUMP,
-        SCROLL_OFF, file_color, level_color,
+        SCROLL_OFF, SEARCH, SEARCH_TEXT, file_color, level_color,
     },
     io::{
         FileKind, clipboard,
@@ -64,7 +67,10 @@ const HELP: &[HelpSection] = &[
     },
     HelpSection {
         title: "marking",
-        keys: &[("space", "mark or unmark"), ("esc", "clear every mark")],
+        keys: &[
+            ("space", "mark or unmark"),
+            ("esc", "clear search, then marks, then plan"),
+        ],
     },
     HelpSection {
         title: "staging",
@@ -213,7 +219,7 @@ impl Navigator {
             KeyCode::Char('L') => self.toggle_log_panel(),
 
             KeyCode::Char(' ') => self.toggle_mark(),
-            KeyCode::Esc => self.clear_marks(),
+            KeyCode::Esc => self.back_out(),
             KeyCode::Char('c') => self.stage_into_here(|from, to| Op::Copy { from, to }),
             KeyCode::Char('m') => self.stage_into_here(|from, to| Op::Move { from, to }),
             KeyCode::Char('d') => self.stage_trash(),
@@ -422,10 +428,24 @@ impl Navigator {
         }
     }
 
-    fn clear_marks(&mut self) {
-        if !self.marks.is_empty() {
+    /// Undoes one intention at a time: the search first, then the marks, then the
+    /// staged plan.
+    ///
+    /// None of them has touched the disk, so all three are only intentions — they
+    /// come off least deliberate first, so a reflexive esc after a search cannot
+    /// take a plan with it. Unlike vim's `:nohlsearch`, the search itself goes and
+    /// not just its highlight: one esc, one thing gone, and `n` has nothing left to
+    /// repeat.
+    fn back_out(&mut self) {
+        if !self.search.is_empty() {
+            log::info!("Cleared the search for {:?}", self.search);
+            self.search.clear();
+        } else if !self.marks.is_empty() {
             log::info!("Cleared {} marks", self.marks.len());
             self.marks.clear();
+        } else if !self.plan.is_empty() {
+            log::info!("Discarded {} staged operation(s)", self.plan.len());
+            self.plan.clear();
         }
     }
 
@@ -437,8 +457,9 @@ impl Navigator {
                 continue;
             };
             let to = self.current_dir.join(name);
-            self.plan.push(build(from, to));
-            staged += 1;
+            if self.plan.push(build(from, to)) {
+                staged += 1;
+            }
         }
         log::info!(
             "Staged {staged} operation(s) into {}",
@@ -447,11 +468,13 @@ impl Navigator {
     }
 
     fn stage_trash(&mut self) {
-        let targets = self.targets();
-        for path in &targets {
-            self.plan.push(Op::Trash(path.clone()));
+        let mut staged = 0;
+        for path in self.targets() {
+            if self.plan.push(Op::Trash(path)) {
+                staged += 1;
+            }
         }
-        log::info!("Staged {} for the trash", targets.len());
+        log::info!("Staged {staged} for the trash");
     }
 
     fn begin_prompt(&mut self, label: &'static str, action: PromptAction) {
@@ -526,8 +549,12 @@ impl Navigator {
         }
 
         match prompt.action {
-            PromptAction::CreateFile => self.plan.push(Op::CreateFile(self.current_dir.join(name))),
-            PromptAction::CreateDir => self.plan.push(Op::CreateDir(self.current_dir.join(name))),
+            PromptAction::CreateFile => {
+                self.plan.push(Op::CreateFile(self.current_dir.join(name)));
+            }
+            PromptAction::CreateDir => {
+                self.plan.push(Op::CreateDir(self.current_dir.join(name)));
+            }
             PromptAction::Rename(from) => {
                 let to = self.current_dir.join(name);
                 self.plan.push(Op::Move { from, to });
@@ -880,7 +907,7 @@ impl Navigator {
                 Style::new().fg(color)
             };
 
-            let line = Line::from(vec![
+            let mut spans = vec![
                 Span::styled(
                     if under_cursor { CURSOR_BAR } else { " " },
                     Style::new().fg(ACCENT),
@@ -889,9 +916,10 @@ impl Navigator {
                 Span::raw(" "),
                 Span::styled(icon_for(entry), Style::new().fg(color)),
                 Span::raw(" "),
-                Span::styled(entry.name.clone(), name),
-            ]);
-            line.render(row(inner, i - self.scroll_offset), buf);
+            ];
+            spans.extend(name_spans(&entry.name, &self.search, name));
+
+            Line::from(spans).render(row(inner, i - self.scroll_offset), buf);
         }
     }
 
@@ -1199,12 +1227,57 @@ fn indices_from(len: usize, from: usize) -> impl DoubleEndedIterator<Item = usiz
 /// Whether `name` contains `query`, ignoring case until the query has a capital
 /// in it — vim's smartcase, and the same reflex applied to a listing.
 fn matches(name: &str, query: &str) -> bool {
-    if query.chars().any(char::is_uppercase) {
-        return name.contains(query);
+    !match_ranges(name, query).is_empty()
+}
+
+/// Every place `query` occurs in `name`, as byte ranges into `name`.
+///
+/// The cursor and the highlight both read this, so a row can never be jumped to
+/// without lighting up, or lit up without being findable.
+fn match_ranges(name: &str, query: &str) -> Vec<Range<usize>> {
+    if query.is_empty() {
+        return Vec::new();
     }
 
-    // The query has no capitals to fold, so only the name needs lowering.
-    name.to_lowercase().contains(query)
+    if query.chars().any(char::is_uppercase) {
+        return name
+            .match_indices(query)
+            .map(|(at, found)| at..at + found.len())
+            .collect();
+    }
+
+    // The query has no capitals to fold, so only the name needs lowering — but
+    // lowering a character can change how wide it is, so where a match lands in
+    // the lowered copy is not where it lands in the name. `origins` carries each
+    // lowered byte back to the character it came from.
+    let mut lowered = String::with_capacity(name.len());
+    let mut origins = Vec::with_capacity(name.len() + 1);
+    for (at, character) in name.char_indices() {
+        lowered.extend(character.to_lowercase());
+        origins.resize(lowered.len(), at);
+    }
+    origins.push(name.len());
+
+    lowered
+        .match_indices(query)
+        .map(|(at, found)| origins[at]..origins[at + found.len()])
+        .collect()
+}
+
+/// `name`, cut into the parts the search matched and the parts it did not, so the
+/// matches can be lit — vim's hlsearch, over a listing.
+fn name_spans(name: &str, query: &str, style: Style) -> Vec<Span<'static>> {
+    let lit = Style::new().bg(SEARCH).fg(SEARCH_TEXT);
+    let mut spans = Vec::new();
+    let mut at = 0;
+
+    for Range { start, end } in match_ranges(name, query) {
+        spans.push(Span::styled(name[at..start].to_string(), style));
+        spans.push(Span::styled(name[start..end].to_string(), lit));
+        at = end;
+    }
+    spans.push(Span::styled(name[at..].to_string(), style));
+    spans
 }
 
 fn index_of(entries: &[DirEntry], name: &str) -> Option<usize> {
@@ -1271,6 +1344,22 @@ mod tests {
     /// The name under the cursor.
     fn selected(nav: &Navigator) -> &str {
         &nav.entries[nav.selected].name
+    }
+
+    /// What is drawn on the search highlight, one entry per row that has any.
+    fn lit(nav: &mut Navigator, width: u16, height: u16) -> Vec<String> {
+        let area = Rect::new(0, 0, width, height);
+        let mut buf = Buffer::empty(area);
+        nav.render(area, &mut buf);
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .filter(|&x| buf[(x, y)].bg == SEARCH)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .filter(|row| !row.is_empty())
+            .collect()
     }
 
     #[test]
@@ -1677,6 +1766,40 @@ mod tests {
     }
 
     #[test]
+    fn escape_discards_the_plan_once_the_marks_are_gone() {
+        let tmp = TempDir::new();
+        tmp.file("a.txt", "");
+        tmp.dir("sub");
+
+        let mut nav = open(tmp.path(), None);
+        mark(&mut nav, "a.txt");
+        nav.go_to(tmp.path().join("sub")).unwrap();
+        press(&mut nav, 'c');
+
+        // The marks go first: they are what the plan was built from, and losing
+        // both to one keypress would be a surprise.
+        key(&mut nav, KeyCode::Esc);
+        assert!(nav.marks.is_empty());
+        assert_eq!(nav.plan.len(), 1, "the plan should have survived");
+
+        key(&mut nav, KeyCode::Esc);
+        assert!(nav.plan.is_empty());
+    }
+
+    #[test]
+    fn escape_with_nothing_to_back_out_of_does_nothing() {
+        let tmp = TempDir::new();
+        tmp.file("a.txt", "");
+
+        let mut nav = open(tmp.path(), Some("a.txt"));
+        key(&mut nav, KeyCode::Esc);
+
+        assert!(nav.marks.is_empty());
+        assert!(nav.plan.is_empty());
+        assert_eq!(selected(&nav), "a.txt");
+    }
+
+    #[test]
     fn staging_with_nothing_marked_uses_the_cursor() {
         let tmp = TempDir::new();
         tmp.file("lonely.txt", "");
@@ -1728,6 +1851,25 @@ mod tests {
 
         assert_eq!(read(&tmp.path().join("dest/travelling.txt")), "contents");
         assert!(!source.exists());
+    }
+
+    #[test]
+    fn staging_the_same_thing_twice_stages_it_once() {
+        let tmp = TempDir::new();
+        tmp.file("x.txt", "");
+        tmp.dir("sub");
+
+        let mut nav = open(tmp.path(), None);
+        mark(&mut nav, "x.txt");
+        nav.go_to(tmp.path().join("sub")).unwrap();
+        press(&mut nav, 'c');
+        press(&mut nav, 'c');
+        press(&mut nav, 'd');
+        press(&mut nav, 'd');
+
+        // One copy and one trash, not two of each: the second of each pair would
+        // only have failed on work the first had already done.
+        assert_eq!(nav.plan.len(), 2);
     }
 
     #[test]
@@ -2074,6 +2216,88 @@ mod tests {
         type_name(&mut nav, "READ");
 
         assert_eq!(selected(&nav), "notes.txt", "READ should match nothing");
+    }
+
+    #[test]
+    fn the_search_lights_up_every_match_in_the_listing() {
+        let tmp = searchable();
+
+        let mut nav = open(tmp.path(), None);
+        press(&mut nav, '/');
+        type_name(&mut nav, "m");
+
+        // Both matching rows, not only the one the cursor landed on.
+        assert_eq!(lit(&mut nav, 80, 24), ["m", "m"]);
+    }
+
+    #[test]
+    fn a_name_matching_twice_is_lit_twice() {
+        let tmp = TempDir::new();
+        tmp.file("banana.txt", "");
+
+        let mut nav = open(tmp.path(), None);
+        press(&mut nav, '/');
+        type_name(&mut nav, "an");
+
+        assert_eq!(lit(&mut nav, 80, 24), ["anan"]);
+    }
+
+    #[test]
+    fn the_highlight_lands_on_the_match_in_a_name_that_is_not_ascii() {
+        let tmp = TempDir::new();
+        tmp.file("Ärger.txt", "");
+
+        let mut nav = open(tmp.path(), None);
+        press(&mut nav, '/');
+        type_name(&mut nav, "är");
+
+        // Lowering "Ä" could have moved every later byte; the highlight is placed
+        // by where the match falls in the name, not in the lowered copy.
+        assert_eq!(lit(&mut nav, 80, 24), ["Är"]);
+    }
+
+    #[test]
+    fn the_highlight_outlives_the_prompt_and_goes_out_on_escape() {
+        let tmp = searchable();
+
+        let mut nav = open(tmp.path(), None);
+        press(&mut nav, '/');
+        type_name(&mut nav, "m1");
+        key(&mut nav, KeyCode::Enter);
+        assert_eq!(lit(&mut nav, 80, 24), ["m1"], "still lit after enter");
+
+        key(&mut nav, KeyCode::Esc);
+        assert!(lit(&mut nav, 80, 24).is_empty());
+    }
+
+    #[test]
+    fn escape_puts_out_the_highlight_before_it_touches_the_marks() {
+        let tmp = searchable();
+
+        let mut nav = open(tmp.path(), None);
+        mark(&mut nav, "other.txt");
+        press(&mut nav, '/');
+        type_name(&mut nav, "m1");
+        key(&mut nav, KeyCode::Enter);
+
+        key(&mut nav, KeyCode::Esc);
+        assert!(lit(&mut nav, 80, 24).is_empty());
+        assert_eq!(nav.marks.len(), 1, "the marks should have survived");
+
+        key(&mut nav, KeyCode::Esc);
+        assert!(nav.marks.is_empty());
+    }
+
+    #[test]
+    fn an_abandoned_search_leaves_nothing_lit() {
+        let tmp = searchable();
+
+        let mut nav = open(tmp.path(), None);
+        press(&mut nav, '/');
+        type_name(&mut nav, "m1");
+        key(&mut nav, KeyCode::Esc);
+
+        assert!(lit(&mut nav, 80, 24).is_empty());
     }
 
     #[test]
