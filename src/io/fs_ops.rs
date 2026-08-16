@@ -28,11 +28,42 @@ pub fn problem(op: &Op) -> Option<Problem> {
     }
 
     // Trash always has somewhere to put things; everything else writes a new path.
-    if !matches!(op, Op::Trash(_)) && exists(op.destination()) {
+    if !matches!(op, Op::Trash(_)) && taken(op) {
         return Some(Problem::DestinationExists);
     }
 
     None
+}
+
+/// Whether something that is not this operation's own source is in the way.
+///
+/// On a case-insensitive filesystem — the default on macOS — renaming `readme.md`
+/// to `README.md` has a destination that already exists: the file being renamed.
+/// `rename` does that correctly, so it is real work rather than a conflict. A
+/// copy is not exempt: `copy` would open the file it reads from for truncation.
+fn taken(op: &Op) -> bool {
+    let to = op.destination();
+
+    if !exists(to) {
+        return false;
+    }
+
+    !matches!(op, Op::Move { from, .. } if same_file(from, to))
+}
+
+#[cfg(unix)]
+fn same_file(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    match (fs::symlink_metadata(a), fs::symlink_metadata(b)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+const fn same_file(_a: &Path, _b: &Path) -> bool {
+    false
 }
 
 /// Runs `op`. Callers check [`problem`] first; this still refuses to clobber.
@@ -48,10 +79,26 @@ pub fn apply(op: &Op) -> Resultx<()> {
 
         Op::Trash(path) => trash(path).map(drop),
 
-        Op::Copy { from, to } => copy_tree(from, to),
+        Op::Copy { from, to } => refuse_to_clobber(op).and_then(|()| copy_tree(from, to)),
 
-        Op::Move { from, to } => rename_or_move(from, to),
+        Op::Move { from, to } => refuse_to_clobber(op).and_then(|()| rename_or_move(from, to)),
     }
+}
+
+/// Fails if the destination is occupied.
+///
+/// [`problem`] already checked, but an earlier operation in the same plan may
+/// have taken the name since — two entries of the same name marked in different
+/// directories and copied here both want it — and neither `rename` nor `copy`
+/// says a word before overwriting.
+fn refuse_to_clobber(op: &Op) -> Resultx<()> {
+    if taken(op) {
+        return Err(Errx::any(format!(
+            "{} already exists",
+            op.destination().display()
+        )));
+    }
+    Ok(())
 }
 
 /// Where deleted entries go. One directory per run, under a shared root.
@@ -63,7 +110,7 @@ pub fn trash_root() -> PathBuf {
 
 /// Moves `path` into the trash, returning where it landed.
 fn trash(path: &Path) -> Resultx<PathBuf> {
-    let destination = trash_root().join(mirrored(path));
+    let destination = free_name(&trash_root().join(mirrored(path)));
 
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)
@@ -83,6 +130,26 @@ fn mirrored(path: &Path) -> PathBuf {
     path.components()
         .filter(|component| !matches!(component, Component::RootDir | Component::Prefix(_)))
         .collect()
+}
+
+/// `wanted` with a counter appended until nothing is in the way.
+///
+/// Deleting one path twice in a session is ordinary — remove a build directory,
+/// rebuild it, remove it again — and mirroring the tree gives both deletes the
+/// same slot. The second must neither overwrite the first nor fail on a name
+/// already taken, which is what `rename` does to a directory that is not empty.
+fn free_name(wanted: &Path) -> PathBuf {
+    let mut candidate = wanted.to_path_buf();
+    let mut taken = 0;
+
+    while exists(&candidate) {
+        taken += 1;
+        let mut name = wanted.file_name().unwrap_or_default().to_os_string();
+        name.push(format!(".{taken}"));
+        candidate = wanted.with_file_name(name);
+    }
+
+    candidate
 }
 
 /// Renames `from` to `to`, falling back to copy-then-remove across filesystems.
@@ -373,6 +440,95 @@ mod tests {
     }
 
     #[test]
+    fn trashing_one_path_twice_keeps_both_copies() {
+        let tmp = TempDir::new();
+        let path = tmp.file("notes.txt", "first version");
+
+        apply(&Op::Trash(path.clone())).unwrap();
+        tmp.file("notes.txt", "second version");
+        apply(&Op::Trash(path.clone())).unwrap();
+
+        let landed = trash_root().join(mirrored(&path));
+        assert_eq!(read(&landed), "first version");
+        assert_eq!(
+            read(&landed.with_file_name("notes.txt.1")),
+            "second version"
+        );
+    }
+
+    #[test]
+    fn trashing_a_directory_twice_does_not_fail_on_the_first_one() {
+        let tmp = TempDir::new();
+        tmp.file("build/output.o", "first");
+        let path = tmp.path().join("build");
+
+        apply(&Op::Trash(path.clone())).unwrap();
+        tmp.file("build/output.o", "second");
+
+        // `rename` onto a directory that is not empty fails outright, so without a
+        // free name the second delete could not happen at all.
+        apply(&Op::Trash(path.clone())).unwrap();
+
+        assert!(!path.exists());
+        let landed = trash_root().join(mirrored(&path));
+        assert_eq!(read(&landed.join("output.o")), "first");
+        assert_eq!(
+            read(&landed.with_file_name("build.1").join("output.o")),
+            "second"
+        );
+    }
+
+    #[test]
+    fn a_copy_refuses_the_name_another_operation_took_first() {
+        let tmp = TempDir::new();
+        let first = tmp.file("one/notes.txt", "from one");
+        let second = tmp.file("two/notes.txt", "from two");
+        let to = tmp.dir("dest").join("notes.txt");
+
+        // Both passed preflight together: the destination was free for each.
+        apply(&Op::Copy {
+            from: first,
+            to: to.clone(),
+        })
+        .unwrap();
+        let clash = apply(&Op::Copy {
+            from: second,
+            to: to.clone(),
+        });
+
+        assert!(
+            clash.is_err(),
+            "the second copy must not overwrite the first"
+        );
+        assert_eq!(read(&to), "from one");
+    }
+
+    #[test]
+    fn a_move_refuses_the_name_another_operation_took_first() {
+        let tmp = TempDir::new();
+        let first = tmp.file("one/notes.txt", "from one");
+        let second = tmp.file("two/notes.txt", "from two");
+        let to = tmp.dir("dest").join("notes.txt");
+
+        apply(&Op::Move {
+            from: first,
+            to: to.clone(),
+        })
+        .unwrap();
+        let clash = apply(&Op::Move {
+            from: second.clone(),
+            to: to.clone(),
+        });
+
+        assert!(clash.is_err());
+        assert_eq!(read(&to), "from one");
+        assert!(
+            second.exists(),
+            "a refused move must leave its source alone"
+        );
+    }
+
+    #[test]
     fn the_trash_path_mirrors_the_original() {
         let path = Path::new("/Users/ioan/project/old.rs");
 
@@ -443,6 +599,55 @@ mod tests {
         };
 
         assert_eq!(problem(&op), Some(Problem::DirectoryIntoItself));
+    }
+
+    /// Whether the filesystem under the tests tells `a` from `A`. On the ones that
+    /// do not — macOS by default — a rename that only changes case has a
+    /// destination that already exists, and it is the file being renamed.
+    fn case_insensitive(tmp: &TempDir) -> bool {
+        tmp.file("case-probe", "");
+        let same = exists(&tmp.path().join("CASE-PROBE"));
+        fs::remove_file(tmp.path().join("case-probe")).unwrap();
+        same
+    }
+
+    #[test]
+    fn a_rename_that_only_changes_case_goes_through() {
+        let tmp = TempDir::new();
+        if !case_insensitive(&tmp) {
+            return;
+        }
+
+        let from = tmp.file("readme.md", "contents");
+        let to = tmp.path().join("README.md");
+        let op = Op::Move {
+            from,
+            to: to.clone(),
+        };
+
+        assert_eq!(problem(&op), None, "the file is not in its own way");
+
+        apply(&op).unwrap();
+        assert_eq!(read(&to), "contents");
+    }
+
+    #[test]
+    fn a_copy_onto_the_file_it_reads_from_is_still_refused() {
+        let tmp = TempDir::new();
+        if !case_insensitive(&tmp) {
+            return;
+        }
+
+        let from = tmp.file("readme.md", "contents");
+        let op = Op::Copy {
+            from: from.clone(),
+            to: tmp.path().join("README.md"),
+        };
+
+        // `copy` opens its destination for truncation, which here is its source.
+        assert_eq!(problem(&op), Some(Problem::DestinationExists));
+        assert!(apply(&op).is_err());
+        assert_eq!(read(&from), "contents");
     }
 
     #[test]

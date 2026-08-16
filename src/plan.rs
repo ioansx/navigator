@@ -81,14 +81,24 @@ impl Op {
         }
     }
 
-    /// Renames the destination in place, keeping the directory it points into.
-    pub fn retarget(&mut self, name: &str) {
-        let retargeted = match self {
+    /// The path a rename may change.
+    ///
+    /// A trash has none. Its destination is the file being deleted, so renaming
+    /// it would quietly delete something else instead.
+    pub const fn destination_mut(&mut self) -> Option<&mut PathBuf> {
+        match self {
+            Self::Trash(_) => None,
             Self::CreateFile(path)
             | Self::CreateDir(path)
-            | Self::Trash(path)
             | Self::Copy { to: path, .. }
-            | Self::Move { to: path, .. } => path,
+            | Self::Move { to: path, .. } => Some(path),
+        }
+    }
+
+    /// Renames the destination in place, keeping the directory it points into.
+    pub fn retarget(&mut self, name: &str) {
+        let Some(retargeted) = self.destination_mut() else {
+            return;
         };
 
         let parent = retargeted
@@ -346,6 +356,19 @@ mod tests {
         op.retarget("right");
 
         assert_eq!(op.destination(), Path::new("/a/right"));
+    }
+
+    #[test]
+    fn retargeting_a_trash_does_not_point_it_at_another_file() {
+        let mut op = Op::Trash(p("/a/doomed.txt"));
+        op.retarget("keeper.txt");
+
+        assert_eq!(
+            op,
+            Op::Trash(p("/a/doomed.txt")),
+            "a rename must never change which file is deleted"
+        );
+        assert_eq!(op.destination_mut(), None);
     }
 
     #[test]

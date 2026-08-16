@@ -40,7 +40,7 @@ pub fn run_navigator(terminal: &mut DefaultTerminal, args: &Args) -> Resultx<()>
 
         let event = ratatui::crossterm::event::read()?;
         if let Some(key) = event.as_key_event()
-            && navigator.handle_key(key)?
+            && navigator.handle_key(key)
         {
             return Ok(());
         }

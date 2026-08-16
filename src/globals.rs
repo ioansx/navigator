@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use log::Level;
 use ratatui::style::Color;
 
@@ -35,7 +37,13 @@ pub fn file_color(name: &str, is_dir: bool) -> Color {
         return Color::DarkGray;
     }
 
-    let ext = name.rsplit('.').next().unwrap_or("").to_lowercase();
+    // The extension, not the tail after the last dot: a file named `rs` or `c`
+    // has no extension at all, and is not source code for having that name.
+    let ext = Path::new(name)
+        .extension()
+        .map(|ext| ext.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+
     match ext.as_str() {
         // Archives
         "zip" | "tar" | "gz" | "bz2" | "xz" | "7z" | "rar" | "zst" => Color::Red,
@@ -133,5 +141,19 @@ mod tests {
     #[test]
     fn a_file_with_no_extension_is_not_miscolored() {
         assert_eq!(file_color("README", false), Color::Reset);
+    }
+
+    #[test]
+    fn a_name_that_is_only_an_extension_is_not_that_kind_of_file() {
+        // `rsplit('.')` on a name with no dot in it hands back the whole name.
+        for name in ["rs", "c", "go", "zip", "pdf"] {
+            assert_eq!(file_color(name, false), Color::Reset, "{name}");
+        }
+    }
+
+    #[test]
+    fn only_the_last_extension_colors_the_file() {
+        assert_eq!(file_color("archive.tar.gz", false), Color::Red);
+        assert_eq!(file_color("component.spec.ts", false), Color::Green);
     }
 }

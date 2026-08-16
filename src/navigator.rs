@@ -14,7 +14,7 @@ use ratatui::{
 use ratatui_image::{StatefulImage, picker::Picker, protocol::StatefulProtocol};
 
 use crate::{
-    error::Resultx,
+    error::{Errx, Resultx},
     globals::{
         ACCENT, CURSOR_BAR, DIM, MARK, MARK_DOT, NF_OCT_FILE_DIRECTORY_FILL, SCROLL_JUMP,
         SCROLL_OFF, SEARCH, SEARCH_TEXT, file_color, level_color,
@@ -170,9 +170,14 @@ impl Navigator {
         })
     }
 
-    /// Handles one keypress. Returns `Ok(true)` when the navigator should quit.
-    pub fn handle_key(&mut self, key: KeyEvent) -> Resultx<bool> {
-        match self.mode {
+    /// Handles one keypress. Returns `true` when the navigator should quit.
+    ///
+    /// Nothing a key does is worth ending the session over: a directory that
+    /// cannot be read, a neovim that is not installed, a listing that cannot be
+    /// re-read — each is a line on the status bar, and the navigator stays where
+    /// it is with its marks and its plan intact.
+    pub fn handle_key(&mut self, key: KeyEvent) -> bool {
+        let outcome = match self.mode {
             Mode::Prompt(_) => {
                 self.handle_prompt_key(key);
                 Ok(false)
@@ -184,19 +189,28 @@ impl Navigator {
                 self.mode = Mode::Normal;
                 Ok(false)
             }
-        }
+        };
+
+        outcome.unwrap_or_else(|e| {
+            log::error!("{e}");
+            false
+        })
     }
 
     fn handle_normal_key(&mut self, key: KeyEvent) -> Resultx<bool> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
         match key.code {
+            KeyCode::Char('d') if ctrl => self.move_down_by(SCROLL_JUMP),
+            KeyCode::Char('u') if ctrl => self.move_up_by(SCROLL_JUMP),
+            // Every other letter is a binding only when nothing but shift is held
+            // with it. ctrl-c means "get me out of here" everywhere else, and must
+            // not land on the copy that plain `c` is.
+            KeyCode::Char(_) if held(key) => {}
             KeyCode::Char('q') => {
                 log::info!("Navigator quit");
                 return Ok(true);
             }
-            KeyCode::Char('d') if ctrl => self.move_down_by(SCROLL_JUMP),
-            KeyCode::Char('u') if ctrl => self.move_up_by(SCROLL_JUMP),
             KeyCode::Char('j') | KeyCode::Down => self.move_down(),
             KeyCode::Char('k') | KeyCode::Up => self.move_up(),
             KeyCode::Enter | KeyCode::Char('l') => return self.enter_selected(),
@@ -265,6 +279,9 @@ impl Navigator {
         };
 
         match key.code {
+            // ctrl-something is a command someone expects, not a letter they want
+            // in the name they are typing.
+            KeyCode::Char(_) if held(key) => return,
             KeyCode::Char(c) => prompt.input.push(c),
             KeyCode::Backspace => {
                 prompt.input.pop();
@@ -288,14 +305,22 @@ impl Navigator {
     /// Leaves the prompt with nothing done. A search also puts the cursor back
     /// where it started: typing one was a way of looking around, not of moving.
     fn abandon_prompt(&mut self) {
-        if let Mode::Prompt(prompt) = &self.mode
-            && let PromptAction::Search { origin } = prompt.action
-        {
-            self.selected = origin;
-            // An abandoned search is not one `n` should repeat.
-            self.search.clear();
-        }
-        self.mode = Mode::Normal;
+        let Mode::Prompt(prompt) = &self.mode else {
+            return;
+        };
+
+        self.mode = match prompt.action {
+            PromptAction::Search { origin } => {
+                self.selected = origin;
+                // An abandoned search is not one `n` should repeat.
+                self.search.clear();
+                Mode::Normal
+            }
+            // Back to the screen the prompt was opened from, which for this one is
+            // the review: cancelling a rename is not a reason to leave it.
+            PromptAction::Retarget(_) => Mode::Review,
+            _ => Mode::Normal,
+        };
     }
 
     /// Moves the cursor to what is being typed, so the search answers as it is
@@ -504,13 +529,16 @@ impl Navigator {
     }
 
     fn begin_retarget(&mut self) {
-        let Some(staged) = self.plan.iter().nth(self.review_selected) else {
+        let Some(staged) = self.plan.get_mut(self.review_selected) else {
             return;
         };
 
-        let current = staged
-            .op
-            .destination()
+        let Some(destination) = staged.op.destination_mut() else {
+            log::warn!("a trash has no destination to rename");
+            return;
+        };
+
+        let current = destination
             .file_name()
             .unwrap_or_default()
             .to_string_lossy()
@@ -654,8 +682,17 @@ impl Navigator {
 
     /// Re-reads the current directory, keeping the cursor on the same entry when
     /// it is still there.
+    ///
+    /// The directory itself can be gone — trashed from inside it, or removed by
+    /// something else — which leaves nowhere to stand, so that falls back to the
+    /// nearest ancestor still there rather than showing a listing of a directory
+    /// that no longer exists.
     fn refresh(&mut self) -> Resultx<()> {
-        let entries = dir::read_dir_with_dots(&self.current_dir)?;
+        let Ok(entries) = dir::read_dir_with_dots(&self.current_dir) else {
+            log::warn!("{} is gone", self.current_dir.display());
+            return self.retreat();
+        };
+
         let under_cursor = self
             .entries
             .get(self.selected)
@@ -667,6 +704,20 @@ impl Navigator {
         self.entries = entries;
         self.cached_image = None;
         Ok(())
+    }
+
+    /// Goes to the nearest ancestor that can still be read.
+    fn retreat(&mut self) -> Resultx<()> {
+        let gone = self.current_dir.clone();
+        for ancestor in gone.ancestors().skip(1) {
+            if self.go_to(ancestor.to_path_buf()).is_ok() {
+                return Ok(());
+            }
+        }
+        Err(Errx::any(format!(
+            "nothing above {} can be read",
+            gone.display()
+        )))
     }
 
     pub fn move_up(&mut self) {
@@ -717,18 +768,10 @@ impl Navigator {
             return;
         }
 
-        if self.log_panel_visible {
-            // Expanded: file list on top, log panel takes bottom 70%
-            let chunks = Layout::vertical([Constraint::Percentage(30), Constraint::Percentage(70)])
-                .split(area);
-
-            self.render_file_list(chunks[0], buf);
-            self.render_log_panel(chunks[1], buf);
-            return;
-        }
-
-        // File list + preview, the staged plan when there is one, then one line
-        // that is either what you are typing or the latest message.
+        // The listing, the staged plan when there is one, then one line that is
+        // either what you are typing or the latest message. That last line is
+        // drawn whatever else is on screen: a prompt you cannot see is one you
+        // are typing at blind.
         let plan_rows = if self.plan.is_empty() {
             0
         } else {
@@ -742,7 +785,17 @@ impl Navigator {
         ])
         .split(area);
 
-        self.render_with_preview(chunks[0], buf);
+        if self.log_panel_visible {
+            // The log takes the room the preview had, the listing keeps the top.
+            let split = Layout::vertical([Constraint::Percentage(30), Constraint::Percentage(70)])
+                .split(chunks[0]);
+
+            self.render_file_list(split[0], buf);
+            self.render_log_panel(split[1], buf);
+        } else {
+            self.render_with_preview(chunks[0], buf);
+        }
+
         if plan_rows > 0 {
             self.render_plan_panel(chunks[1], buf);
         }
@@ -796,9 +849,15 @@ impl Navigator {
         ])
         .render(chunks[0], buf);
 
+        // Scrolled just far enough to keep the selected row on screen: `x` drops
+        // what the cursor is on, so the cursor must never be off the bottom.
         let rows = chunks[1];
-        for (i, staged) in self.plan.iter().take(rows.height as usize).enumerate() {
-            plan_row(staged, i == self.review_selected, rows.width).render(row(rows, i), buf);
+        let height = rows.height as usize;
+        let first = (self.review_selected + 1).saturating_sub(height);
+
+        for (i, staged) in self.plan.iter().skip(first).take(height).enumerate() {
+            plan_row(staged, first + i == self.review_selected, rows.width)
+                .render(row(rows, i), buf);
         }
 
         let mut footer = vec![Span::raw(" ")];
@@ -883,12 +942,17 @@ impl Navigator {
         let visible_height = inner.height as usize;
         let scrolloff = SCROLL_OFF.min(visible_height / 2);
 
-        // Adjust scroll offset to keep selection visible with scrolloff context
+        // Keep the cursor on screen with `scrolloff` rows of context beyond it,
+        // but never scroll past the last entry: the context the end of a listing
+        // has to offer is the end of the listing, not a screenful of blank rows.
         if self.selected < self.scroll_offset + scrolloff {
             self.scroll_offset = self.selected.saturating_sub(scrolloff);
         } else if self.selected + scrolloff >= self.scroll_offset + visible_height {
             self.scroll_offset = (self.selected + scrolloff + 1).saturating_sub(visible_height);
         }
+        self.scroll_offset = self
+            .scroll_offset
+            .min(self.entries.len().saturating_sub(visible_height));
 
         for (i, entry) in self
             .entries
@@ -1084,11 +1148,14 @@ fn render_help(area: Rect, buf: &mut Buffer) {
     Line::styled(" press any key to go back", Style::new().fg(DIM)).render(chunks[2], buf);
 }
 
-/// Packs the sections into columns `height` rows tall.
+/// Packs the sections into columns at most `height` rows tall.
 ///
 /// A section is never split across two columns: half a group of keys stranded at
-/// the bottom of one column reads as a different group than it is.
+/// the bottom of one column reads as a different group than it is. A section
+/// taller than the whole screen has no whole column to be kept in, and spills
+/// into the next one rather than over what is drawn below the help.
 fn help_columns(height: usize) -> Vec<Vec<Line<'static>>> {
+    let height = height.max(1);
     let mut columns = Vec::new();
     let mut current: Vec<Line<'static>> = Vec::new();
 
@@ -1103,6 +1170,11 @@ fn help_columns(height: usize) -> Vec<Vec<Line<'static>>> {
             }
         }
         current.extend(lines);
+
+        while current.len() > height {
+            let spilled = current.split_off(height);
+            columns.push(std::mem::replace(&mut current, spilled));
+        }
     }
 
     if !current.is_empty() {
@@ -1247,20 +1319,22 @@ fn match_ranges(name: &str, query: &str) -> Vec<Range<usize>> {
     }
 
     // The query has no capitals to fold, so only the name needs lowering — but
-    // lowering a character can change how wide it is, so where a match lands in
-    // the lowered copy is not where it lands in the name. `origins` carries each
-    // lowered byte back to the character it came from.
+    // lowering a character can change how wide it is, and one can even become
+    // two ("İ" lowers to an i and a combining dot), so where a match lands in the
+    // lowered copy is not where it lands in the name. `origins` carries each
+    // lowered byte back to the character it came from, whole: a match that covers
+    // any part of a character lights all of it, so a row can never be jumped to
+    // without lighting up.
     let mut lowered = String::with_capacity(name.len());
-    let mut origins = Vec::with_capacity(name.len() + 1);
+    let mut origins: Vec<Range<usize>> = Vec::with_capacity(name.len());
     for (at, character) in name.char_indices() {
         lowered.extend(character.to_lowercase());
-        origins.resize(lowered.len(), at);
+        origins.resize(lowered.len(), at..at + character.len_utf8());
     }
-    origins.push(name.len());
 
     lowered
         .match_indices(query)
-        .map(|(at, found)| origins[at]..origins[at + found.len()])
+        .map(|(at, found)| origins[at].start..origins[at + found.len() - 1].end)
         .collect()
 }
 
@@ -1278,6 +1352,12 @@ fn name_spans(name: &str, query: &str, style: Style) -> Vec<Span<'static>> {
     }
     spans.push(Span::styled(name[at..].to_string(), style));
     spans
+}
+
+/// Whether anything beyond shift was held: shift is how a capital is typed, so it
+/// is part of the letter rather than a modifier on it.
+const fn held(key: KeyEvent) -> bool {
+    !key.modifiers.difference(KeyModifiers::SHIFT).is_empty()
 }
 
 fn index_of(entries: &[DirEntry], name: &str) -> Option<usize> {
@@ -1581,11 +1661,11 @@ mod tests {
     }
 
     fn press(nav: &mut Navigator, c: char) {
-        nav.handle_key(KeyEvent::from(KeyCode::Char(c))).unwrap();
+        nav.handle_key(KeyEvent::from(KeyCode::Char(c)));
     }
 
     fn key(nav: &mut Navigator, code: KeyCode) {
-        nav.handle_key(KeyEvent::from(code)).unwrap();
+        nav.handle_key(KeyEvent::from(code));
     }
 
     fn type_name(nav: &mut Navigator, name: &str) {
@@ -1613,6 +1693,68 @@ mod tests {
             key(nav, KeyCode::Backspace);
         }
         type_name(nav, name);
+    }
+
+    #[test]
+    fn a_path_that_fits_is_left_alone() {
+        assert_eq!(truncate("/a/b/notes.txt", 40), "/a/b/notes.txt");
+        assert_eq!(truncate("exactly-ten", 11), "exactly-ten");
+    }
+
+    #[test]
+    fn a_path_too_long_keeps_its_tail_and_the_width_it_was_given() {
+        // The tail is what identifies a path, and the row it goes in has no more
+        // columns to give it.
+        assert_eq!(truncate("/home/me/dev/notes.txt", 12), "…v/notes.txt");
+        assert_eq!(truncate("/home/me/dev/notes.txt", 12).chars().count(), 12);
+    }
+
+    #[test]
+    fn there_is_a_narrowest_a_path_can_get() {
+        assert_eq!(truncate("/a/b/c", 1), "…");
+        assert_eq!(truncate("/a/b/c", 0), "");
+    }
+
+    #[test]
+    fn truncating_never_cuts_a_character_in_half() {
+        // Every one of these is several bytes wide, so counting bytes would slice
+        // one down the middle and panic.
+        assert_eq!(truncate("🦀🦀🦀🦀", 3), "…🦀🦀");
+        assert_eq!(truncate("ärgerlich", 4), "…ich");
+    }
+
+    #[test]
+    fn the_title_picks_out_the_directory_you_are_in() {
+        let title = path_title(Path::new("/home/me/dev/navigator"), 40);
+        let spans: Vec<_> = title
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+
+        assert_eq!(spans, [" ", "/home/me/dev/", "navigator", " "]);
+        assert!(
+            title.spans[2]
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
+    }
+
+    #[test]
+    fn a_narrow_title_still_ends_with_the_directory_you_are_in() {
+        let title = path_title(Path::new("/home/me/dev/navigator"), 14);
+        let shown: String = title
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+
+        assert!(shown.trim().ends_with("navigator"), "{shown:?}");
+        assert!(
+            shown.chars().count() <= 15,
+            "{shown:?} overflows 14 columns"
+        );
     }
 
     #[test]
@@ -1662,6 +1804,21 @@ mod tests {
                 "missing {} in:\n{out}",
                 section.title
             );
+        }
+    }
+
+    #[test]
+    fn no_column_of_keys_is_taller_than_the_screen() {
+        // A section on its own is taller than this, so keeping every one whole
+        // would mean drawing over whatever the help sits on.
+        for height in 0..12 {
+            for column in help_columns(height) {
+                assert!(
+                    column.len() <= height.max(1),
+                    "a column of {} lines does not fit {height} rows",
+                    column.len()
+                );
+            }
         }
     }
 
@@ -2257,6 +2414,22 @@ mod tests {
     }
 
     #[test]
+    fn a_row_the_search_jumped_to_is_always_lit() {
+        let tmp = TempDir::new();
+        // "İ" is the one letter that lowercases into two characters, so a match on
+        // the "i" it becomes covers only part of what is on the screen.
+        tmp.file("İstanbul.txt", "");
+        tmp.file("other.txt", "");
+
+        let mut nav = open(tmp.path(), Some("other.txt"));
+        press(&mut nav, '/');
+        type_name(&mut nav, "i");
+
+        assert_eq!(selected(&nav), "İstanbul.txt");
+        assert_eq!(lit(&mut nav, 80, 24), ["İ"]);
+    }
+
+    #[test]
     fn the_highlight_outlives_the_prompt_and_goes_out_on_escape() {
         let tmp = searchable();
 
@@ -2462,6 +2635,138 @@ mod tests {
     }
 
     #[test]
+    fn two_entries_of_one_name_cannot_both_land_on_the_same_destination() {
+        let tmp = TempDir::new();
+        tmp.file("one/notes.txt", "from one");
+        tmp.file("two/notes.txt", "from two");
+        tmp.dir("dest");
+
+        // Both marks pass preflight: neither destination exists until the other
+        // operation has run.
+        let mut nav = open(&tmp.path().join("one"), Some("notes.txt"));
+        press(&mut nav, ' ');
+        nav.go_to(tmp.path().join("two")).unwrap();
+        mark(&mut nav, "notes.txt");
+        nav.go_to(tmp.path().join("dest")).unwrap();
+        press(&mut nav, 'c');
+        apply(&mut nav);
+
+        assert_eq!(read(&tmp.path().join("dest/notes.txt")), "from one");
+        assert_eq!(
+            nav.plan.len(),
+            1,
+            "the one that could not have its name must stay staged"
+        );
+        assert!(nav.plan.iter().next().unwrap().failure.is_some());
+    }
+
+    #[test]
+    fn renaming_in_review_cannot_point_a_trash_at_another_file() {
+        let tmp = TempDir::new();
+        tmp.file("doomed.txt", "delete me");
+        tmp.file("keeper.txt", "keep me");
+
+        let mut nav = open(tmp.path(), Some("doomed.txt"));
+        press(&mut nav, 'd');
+        press(&mut nav, 'p');
+        press(&mut nav, 'r');
+
+        assert!(
+            matches!(nav.mode, Mode::Review),
+            "there is no destination to rename, so no prompt should open"
+        );
+
+        key(&mut nav, KeyCode::Enter);
+        assert!(!tmp.path().join("doomed.txt").exists());
+        assert_eq!(read(&tmp.path().join("keeper.txt")), "keep me");
+    }
+
+    #[test]
+    fn the_review_cursor_stays_on_screen_when_the_plan_is_long() {
+        let tmp = TempDir::new();
+        for i in 0..30 {
+            tmp.file(&format!("file{i:02}.txt"), "");
+        }
+
+        let mut nav = open(tmp.path(), None);
+        for i in 0..30 {
+            mark(&mut nav, &format!("file{i:02}.txt"));
+        }
+        press(&mut nav, 'd');
+        press(&mut nav, 'p');
+        for _ in 0..29 {
+            press(&mut nav, 'j');
+        }
+        let out = render_to_string(&mut nav, 60, 12);
+
+        // `x` drops the row the cursor is on, so it has to be a row you can see.
+        assert!(out.contains("file29.txt"), "in:\n{out}");
+        assert!(
+            out.lines().any(|line| line.starts_with(CURSOR_BAR)),
+            "the cursor scrolled off the screen:\n{out}"
+        );
+    }
+
+    #[test]
+    fn a_prompt_is_visible_with_the_log_panel_open() {
+        let tmp = TempDir::new();
+        tmp.file("a.txt", "");
+
+        let mut nav = open(tmp.path(), Some("a.txt"));
+        press(&mut nav, 'L');
+        press(&mut nav, 'a');
+        type_name(&mut nav, "typed.txt");
+        let out = render_to_string(&mut nav, 80, 24);
+
+        assert!(out.contains("new file"), "the label is missing in:\n{out}");
+        assert!(
+            out.contains("typed.txt"),
+            "what was typed is hidden in:\n{out}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_that_cannot_be_read_does_not_end_the_session() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new();
+        let locked = tmp.dir("locked");
+        tmp.file("marked.txt", "");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let mut nav = open(tmp.path(), Some("marked.txt"));
+        press(&mut nav, ' ');
+        nav.selected = index_of(&nav.entries, "locked").unwrap();
+        let quit = nav.handle_key(KeyEvent::from(KeyCode::Enter));
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(!quit, "a directory you cannot read is not a reason to quit");
+        assert_eq!(nav.current_dir, tmp.path(), "and it stays where it was");
+        assert_eq!(nav.marks.len(), 1, "with the session's work intact");
+    }
+
+    #[test]
+    fn trashing_the_directory_you_are_standing_in_backs_out_of_it() {
+        let tmp = TempDir::new();
+        tmp.file("doomed/inside.txt", "");
+
+        let mut nav = open(tmp.path(), Some("doomed"));
+        press(&mut nav, ' ');
+        nav.enter_selected().unwrap();
+        press(&mut nav, 'd');
+        apply(&mut nav);
+
+        assert!(!tmp.path().join("doomed").exists());
+        assert_eq!(
+            nav.current_dir,
+            tmp.path(),
+            "standing in a directory that is gone shows a listing that is a lie"
+        );
+    }
+
+    #[test]
     fn the_plan_panel_shows_staged_work() {
         let tmp = TempDir::new();
         tmp.file("doomed.txt", "");
@@ -2522,6 +2827,77 @@ mod tests {
     }
 
     #[test]
+    fn the_end_of_a_listing_fills_the_screen() {
+        let tmp = TempDir::new();
+        for i in 0..20 {
+            tmp.file(&format!("file{i:02}.txt"), "");
+        }
+
+        let mut nav = open(tmp.path(), Some("file19.txt"));
+        let out = render_to_string(&mut nav, 40, 12);
+
+        // The scrolloff would otherwise scroll eight rows past the last entry,
+        // leaving most of the screen blank while entries sit above the top.
+        assert!(out.contains("file19.txt"), "in:\n{out}");
+        assert!(
+            out.contains("file11.txt"),
+            "half the screen is blank in:\n{out}"
+        );
+    }
+
+    #[test]
+    fn a_letter_held_with_ctrl_is_not_the_letter() {
+        let tmp = TempDir::new();
+        tmp.file("a.txt", "");
+
+        let mut nav = open(tmp.path(), Some("a.txt"));
+        for c in ['c', 'm', 'd', 'a', 'r', 'y'] {
+            nav.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+        }
+
+        assert!(nav.plan.is_empty(), "ctrl-c must not stage a copy");
+        assert!(matches!(nav.mode, Mode::Normal), "nor open a prompt");
+    }
+
+    #[test]
+    fn ctrl_and_a_letter_does_not_type_the_letter() {
+        let tmp = TempDir::new();
+
+        let mut nav = open(tmp.path(), None);
+        press(&mut nav, 'a');
+        type_name(&mut nav, "notes");
+        nav.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        type_name(&mut nav, ".txt");
+        key(&mut nav, KeyCode::Enter);
+
+        assert_eq!(
+            nav.plan.ops().next().unwrap().describe().subject,
+            "notes.txt"
+        );
+    }
+
+    #[test]
+    fn escape_from_a_rename_goes_back_to_the_review() {
+        let tmp = TempDir::new();
+        tmp.file("a.txt", "");
+        tmp.dir("dest");
+
+        let mut nav = open(tmp.path(), Some("a.txt"));
+        press(&mut nav, ' ');
+        nav.go_to(tmp.path().join("dest")).unwrap();
+        press(&mut nav, 'c');
+        press(&mut nav, 'p');
+        press(&mut nav, 'r');
+        key(&mut nav, KeyCode::Esc);
+
+        assert!(
+            matches!(nav.mode, Mode::Review),
+            "cancelling a rename should not also leave the review"
+        );
+        assert_eq!(nav.plan.len(), 1);
+    }
+
+    #[test]
     fn navigating_away_drops_the_cached_preview() {
         let tmp = TempDir::new();
         tmp.dir("sub");
@@ -2533,6 +2909,39 @@ mod tests {
 
         assert!(nav.cached_image.is_none());
         assert_eq!(nav.scroll_offset, 0);
+    }
+
+    #[test]
+    fn every_screen_survives_a_terminal_of_any_size() {
+        let tmp = TempDir::new();
+        for i in 0..20 {
+            tmp.file(&format!("file{i:02}.txt"), "");
+        }
+
+        // A floating terminal is whatever size the window is, and drawing a row
+        // that is not there is a panic rather than a smaller screen.
+        for (width, height) in [(1, 1), (2, 2), (4, 3), (12, 5), (200, 1), (3, 40), (80, 24)] {
+            let mut nav = open(tmp.path(), Some("file19.txt"));
+            mark(&mut nav, "file01.txt");
+            press(&mut nav, 'd');
+            render_to_string(&mut nav, width, height);
+
+            press(&mut nav, '/');
+            type_name(&mut nav, "file1");
+            render_to_string(&mut nav, width, height);
+            key(&mut nav, KeyCode::Esc);
+
+            press(&mut nav, 'L');
+            render_to_string(&mut nav, width, height);
+            press(&mut nav, 'L');
+
+            press(&mut nav, '?');
+            render_to_string(&mut nav, width, height);
+            press(&mut nav, '?');
+
+            press(&mut nav, 'p');
+            render_to_string(&mut nav, width, height);
+        }
     }
 
     #[test]
