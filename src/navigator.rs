@@ -57,6 +57,8 @@ const HELP: &[HelpSection] = &[
             ("enter / l", "enter dir, or open in neovim"),
             ("- / h", "go up a level"),
             ("z", "jump to a zoxide directory"),
+            ("/", "search the listing"),
+            ("n / N", "next, previous match"),
             ("q", "quit"),
         ],
     },
@@ -110,6 +112,10 @@ enum PromptAction {
     Retarget(usize),
     /// Go wherever zoxide ranks the typed words highest.
     Jump,
+    /// Walk the listing as the query is typed, from the row it started on.
+    Search {
+        origin: usize,
+    },
 }
 
 pub struct Navigator {
@@ -126,6 +132,8 @@ pub struct Navigator {
     plan: Plan,
     mode: Mode,
     review_selected: usize,
+    /// The last thing searched for, which `n` and `N` repeat.
+    search: String,
 }
 
 impl Navigator {
@@ -152,6 +160,7 @@ impl Navigator {
             plan: Plan::default(),
             mode: Mode::Normal,
             review_selected: 0,
+            search: String::new(),
         })
     }
 
@@ -187,6 +196,20 @@ impl Navigator {
             KeyCode::Enter | KeyCode::Char('l') => return self.enter_selected(),
             KeyCode::Char('-' | 'h') => self.go_to_parent_directory()?,
             KeyCode::Char('z') => self.begin_prompt("jump to", PromptAction::Jump),
+            KeyCode::Char('/') => {
+                self.begin_prompt(
+                    "search",
+                    PromptAction::Search {
+                        origin: self.selected,
+                    },
+                );
+            }
+            KeyCode::Char('n') => {
+                self.select_match(indices_from(self.entries.len(), self.selected + 1));
+            }
+            KeyCode::Char('N') => {
+                self.select_match(indices_from(self.entries.len(), self.selected).rev());
+            }
             KeyCode::Char('L') => self.toggle_log_panel(),
 
             KeyCode::Char(' ') => self.toggle_mark(),
@@ -240,9 +263,62 @@ impl Navigator {
             KeyCode::Backspace => {
                 prompt.input.pop();
             }
-            KeyCode::Esc => self.mode = Mode::Normal,
-            KeyCode::Enter => self.confirm_prompt(),
-            _ => {}
+            KeyCode::Esc => {
+                self.abandon_prompt();
+                return;
+            }
+            KeyCode::Enter => {
+                self.confirm_prompt();
+                return;
+            }
+            _ => return,
+        }
+
+        // What was typed changed. Only a search acts on that at once; every other
+        // prompt waits for enter.
+        self.follow_search();
+    }
+
+    /// Leaves the prompt with nothing done. A search also puts the cursor back
+    /// where it started: typing one was a way of looking around, not of moving.
+    fn abandon_prompt(&mut self) {
+        if let Mode::Prompt(prompt) = &self.mode
+            && let PromptAction::Search { origin } = prompt.action
+        {
+            self.selected = origin;
+            // An abandoned search is not one `n` should repeat.
+            self.search.clear();
+        }
+        self.mode = Mode::Normal;
+    }
+
+    /// Moves the cursor to what is being typed, so the search answers as it is
+    /// written rather than when it is finished.
+    fn follow_search(&mut self) {
+        let Mode::Prompt(prompt) = &self.mode else {
+            return;
+        };
+        let PromptAction::Search { origin } = prompt.action else {
+            return;
+        };
+        self.search = prompt.input.clone();
+
+        // Every keystroke searches afresh from where the search began, so a query
+        // typed one letter too far leaves the cursor where it started rather than
+        // somewhere the query no longer describes.
+        self.selected = origin;
+        self.select_match(indices_from(self.entries.len(), origin));
+    }
+
+    /// Puts the cursor on the first row in `order` that matches the search.
+    fn select_match(&mut self, mut order: impl Iterator<Item = usize>) {
+        if self.search.is_empty() {
+            return;
+        }
+
+        let found = order.find(|&index| matches(&self.entries[index].name, &self.search));
+        if let Some(index) = found {
+            self.selected = index;
         }
     }
 
@@ -430,11 +506,16 @@ impl Navigator {
             return;
         };
 
-        // The one prompt whose input is a search rather than a file name: it may
-        // hold slashes, and nothing on disk is ever named after it.
-        if matches!(prompt.action, PromptAction::Jump) {
-            self.jump(prompt.input.trim());
-            return;
+        // Neither of these types a file name, so neither goes through the name
+        // check that refuses slashes: a search has already moved the cursor as it
+        // was typed, and a jump hands its words to zoxide.
+        match prompt.action {
+            PromptAction::Search { .. } => return,
+            PromptAction::Jump => {
+                self.jump(prompt.input.trim());
+                return;
+            }
+            _ => {}
         }
 
         let name = prompt.input.trim().to_string();
@@ -457,8 +538,8 @@ impl Navigator {
                 }
                 self.mode = Mode::Review;
             }
-            // Taken care of above: a search must not reach the name check.
-            PromptAction::Jump => {}
+            // Both returned above, before the name check they must not reach.
+            PromptAction::Jump | PromptAction::Search { .. } => {}
         }
     }
 
@@ -1107,6 +1188,23 @@ fn preview_text(content: String) -> Paragraph<'static> {
         Style::new()
     };
     Paragraph::new(content).style(style)
+}
+
+/// Every row of a `len`-row listing once, from `from` and wrapping around the
+/// end: the order a search walks it in, and reversed, the order `N` walks it.
+fn indices_from(len: usize, from: usize) -> impl DoubleEndedIterator<Item = usize> {
+    (0..len).map(move |offset| (from + offset) % len)
+}
+
+/// Whether `name` contains `query`, ignoring case until the query has a capital
+/// in it — vim's smartcase, and the same reflex applied to a listing.
+fn matches(name: &str, query: &str) -> bool {
+    if query.chars().any(char::is_uppercase) {
+        return name.contains(query);
+    }
+
+    // The query has no capitals to fold, so only the name needs lowering.
+    name.to_lowercase().contains(query)
 }
 
 fn index_of(entries: &[DirEntry], name: &str) -> Option<usize> {
@@ -1852,6 +1950,157 @@ mod tests {
         key(&mut nav, KeyCode::Esc);
 
         assert!(matches!(nav.mode, Mode::Normal));
+        assert!(nav.plan.is_empty());
+    }
+
+    /// Three entries a search can tell apart: `m1` and `m2` match "m", `other`
+    /// matches neither.
+    fn searchable() -> TempDir {
+        let tmp = TempDir::new();
+        tmp.file("m1.txt", "");
+        tmp.file("m2.txt", "");
+        tmp.file("other.txt", "");
+        tmp
+    }
+
+    #[test]
+    fn the_cursor_follows_the_search_as_it_is_typed() {
+        let tmp = searchable();
+
+        let mut nav = open(tmp.path(), None);
+        press(&mut nav, '/');
+        type_name(&mut nav, "m2");
+
+        assert_eq!(selected(&nav), "m2.txt", "before enter was ever pressed");
+    }
+
+    #[test]
+    fn enter_leaves_the_cursor_on_the_match() {
+        let tmp = searchable();
+
+        let mut nav = open(tmp.path(), None);
+        press(&mut nav, '/');
+        type_name(&mut nav, "m2");
+        key(&mut nav, KeyCode::Enter);
+
+        assert!(matches!(nav.mode, Mode::Normal));
+        assert_eq!(selected(&nav), "m2.txt");
+    }
+
+    #[test]
+    fn escape_puts_the_cursor_back_where_the_search_started() {
+        let tmp = searchable();
+
+        let mut nav = open(tmp.path(), Some("other.txt"));
+        press(&mut nav, '/');
+        type_name(&mut nav, "m1");
+        key(&mut nav, KeyCode::Esc);
+
+        assert!(matches!(nav.mode, Mode::Normal));
+        assert_eq!(selected(&nav), "other.txt");
+    }
+
+    #[test]
+    fn a_query_typed_one_letter_too_far_goes_back_to_where_it_started() {
+        let tmp = searchable();
+
+        let mut nav = open(tmp.path(), Some("other.txt"));
+        press(&mut nav, '/');
+        type_name(&mut nav, "m1");
+        assert_eq!(selected(&nav), "m1.txt");
+
+        // "m1x" matches nothing, and the cursor must not be left on the m1.txt the
+        // query no longer describes.
+        type_name(&mut nav, "x");
+        assert_eq!(selected(&nav), "other.txt");
+
+        // Backspacing that letter finds it again.
+        key(&mut nav, KeyCode::Backspace);
+        assert_eq!(selected(&nav), "m1.txt");
+    }
+
+    #[test]
+    fn n_walks_the_matches_and_wraps() {
+        let tmp = searchable();
+
+        let mut nav = open(tmp.path(), None);
+        press(&mut nav, '/');
+        type_name(&mut nav, "m");
+        key(&mut nav, KeyCode::Enter);
+        assert_eq!(selected(&nav), "m1.txt");
+
+        press(&mut nav, 'n');
+        assert_eq!(selected(&nav), "m2.txt");
+
+        press(&mut nav, 'n');
+        assert_eq!(selected(&nav), "m1.txt", "past the last match it wraps");
+
+        press(&mut nav, 'N');
+        assert_eq!(selected(&nav), "m2.txt", "and back the other way");
+    }
+
+    #[test]
+    fn n_does_nothing_until_something_has_been_searched_for() {
+        let tmp = searchable();
+
+        let mut nav = open(tmp.path(), Some("other.txt"));
+        press(&mut nav, 'n');
+        press(&mut nav, 'N');
+
+        assert_eq!(selected(&nav), "other.txt");
+    }
+
+    #[test]
+    fn a_lowercase_search_ignores_case() {
+        let tmp = TempDir::new();
+        tmp.file("Readme.md", "");
+        tmp.file("notes.txt", "");
+
+        let mut nav = open(tmp.path(), Some("notes.txt"));
+        press(&mut nav, '/');
+        type_name(&mut nav, "read");
+
+        assert_eq!(selected(&nav), "Readme.md");
+    }
+
+    #[test]
+    fn a_capital_in_the_search_makes_it_case_sensitive() {
+        let tmp = TempDir::new();
+        tmp.file("Readme.md", "");
+        tmp.file("notes.txt", "");
+
+        let mut nav = open(tmp.path(), Some("notes.txt"));
+        press(&mut nav, '/');
+        type_name(&mut nav, "READ");
+
+        assert_eq!(selected(&nav), "notes.txt", "READ should match nothing");
+    }
+
+    #[test]
+    fn a_search_holding_a_slash_is_not_refused_as_a_name() {
+        let tmp = searchable();
+
+        let mut nav = open(tmp.path(), None);
+        press(&mut nav, '/');
+        type_name(&mut nav, "src/m1");
+        key(&mut nav, KeyCode::Enter);
+
+        assert!(
+            matches!(nav.mode, Mode::Normal),
+            "a query is not a file name, so the prompt should close"
+        );
+    }
+
+    #[test]
+    fn searching_stages_nothing() {
+        let tmp = searchable();
+
+        let mut nav = open(tmp.path(), None);
+        press(&mut nav, '/');
+        // Every one of these is a staging key in normal mode.
+        type_name(&mut nav, "cmdaAr");
+        key(&mut nav, KeyCode::Esc);
+
         assert!(nav.plan.is_empty());
     }
 
