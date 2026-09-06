@@ -1004,6 +1004,7 @@ impl Navigator {
                     Style::new().fg(ACCENT),
                 ),
                 Span::styled(if marked { MARK_DOT } else { " " }, Style::new().fg(MARK)),
+                Span::raw(" "),
                 Span::styled(icon_for(entry), Style::new().fg(color)),
                 Span::raw(" "),
             ];
