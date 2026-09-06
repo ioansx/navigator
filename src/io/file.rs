@@ -16,6 +16,17 @@ pub fn read_text_preview(path: &Path, max_lines: usize) -> String {
     }
 }
 
+/// Records `dir` for the shell wrapper that `cd`s there once `nav` has exited.
+///
+/// A process cannot change the directory of the shell that started it, so the
+/// wrapper reads the path back out of a file instead. Written as the OS's own
+/// bytes and with no trailing newline, so the shell gets the path back exactly
+/// as it went in.
+pub fn write_cwd(path: &Path, dir: &Path) -> Resultx<()> {
+    fs::write(path, dir.as_os_str().as_encoded_bytes())
+        .map_err(|e| Errx::e_io(e, format!("writing {}", path.display())))
+}
+
 /// Whether `bytes` are text rather than the innards of some binary format.
 pub fn looks_like_text(bytes: &[u8]) -> bool {
     bytes.iter().all(|byte| is_text_byte(*byte)) && std::str::from_utf8(bytes).is_ok()
@@ -65,6 +76,27 @@ mod tests {
 
     fn preview(bytes: &[u8]) -> Option<String> {
         text_preview(bytes, usize::MAX)
+    }
+
+    #[test]
+    fn writes_the_directory_the_shell_should_cd_to() {
+        let tmp = TempDir::new();
+        let cwd_file = tmp.path().join("cwd");
+
+        write_cwd(&cwd_file, tmp.path()).unwrap();
+
+        // No trailing newline: what the shell reads back is the path itself.
+        assert_eq!(
+            fs::read_to_string(&cwd_file).unwrap(),
+            tmp.path().to_str().unwrap()
+        );
+    }
+
+    #[test]
+    fn writing_the_directory_somewhere_unwritable_fails() {
+        let tmp = TempDir::new();
+
+        assert!(write_cwd(&tmp.path().join("no/such/dir/cwd"), tmp.path()).is_err());
     }
 
     #[test]

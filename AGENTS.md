@@ -46,6 +46,25 @@ entry, the terminal's image protocol is queried once at startup. Anything that
 should outlive the process is a new feature with its own storage and staleness
 questions, not a tweak to one of these.
 
+**`Q` moves the shell, `q` does not.** A process cannot `cd` its parent, so `Q`
+writes where the session ended to `--cwd-file <path>` and the shell function in
+`~/.ioansx/fish/config.fish` follows it there. Every other way out — `q`, or
+handing a file to neovim — writes nothing, and the wrapper finds an empty file
+and stays put:
+
+```fish
+function nav --wraps nav
+    set -l cwd_file (mktemp -t nav-cwd)
+    command nav --cwd-file $cwd_file $argv
+    set -l ended (cat $cwd_file)
+    rm -f $cwd_file
+
+    if test -d "$ended"; and test "$ended" != $PWD
+        cd $ended
+    end
+end
+```
+
 ## Conventions
 
 **Tests live beside what they test**, in `#[cfg(test)] mod tests`, named as a

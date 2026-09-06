@@ -8,10 +8,16 @@ mod memory;
 mod navigator;
 mod plan;
 
+use std::path::PathBuf;
+
 use clap::Parser;
 use ratatui::DefaultTerminal;
 
-use crate::{error::Resultx, navigator::Navigator};
+use crate::{
+    error::Resultx,
+    io::file,
+    navigator::{Navigator, Outcome},
+};
 
 #[derive(Parser, Debug)]
 #[command(name = "nav", about = "Terminal file navigator")]
@@ -23,12 +29,20 @@ pub struct Args {
     /// File to select
     #[arg(short, long)]
     pub select: Option<String>,
+
+    /// Where to record the directory you ended in, for a shell wrapper to cd to
+    #[arg(long, value_name = "PATH")]
+    pub cwd_file: Option<PathBuf>,
 }
 
 /// Runs the navigator until the user quits or opens a file in neovim.
 ///
+/// `Q` is the only quit that moves the shell: it records where the session ended
+/// in `--cwd-file`, for the wrapper that `cd`s there.
+///
 /// # Errors
-/// Fails if a directory cannot be read, or if the terminal stops delivering events.
+/// Fails if a directory cannot be read, if the terminal stops delivering events,
+/// or if `--cwd-file` cannot be written.
 pub fn run_navigator(terminal: &mut DefaultTerminal, args: &Args) -> Resultx<()> {
     log::info!("Navigator started in: {}", args.path);
 
@@ -39,10 +53,19 @@ pub fn run_navigator(terminal: &mut DefaultTerminal, args: &Args) -> Resultx<()>
         })?;
 
         let event = ratatui::crossterm::event::read()?;
-        if let Some(key) = event.as_key_event()
-            && navigator.handle_key(key)
-        {
-            return Ok(());
+        let Some(key) = event.as_key_event() else {
+            continue;
+        };
+
+        match navigator.handle_key(key) {
+            Outcome::Stay => {}
+            Outcome::Quit => return Ok(()),
+            Outcome::QuitHere => {
+                if let Some(cwd_file) = &args.cwd_file {
+                    file::write_cwd(cwd_file, navigator.current_dir())?;
+                }
+                return Ok(());
+            }
         }
     }
 }

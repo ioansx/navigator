@@ -33,6 +33,18 @@ use crate::{
 /// How many staged operations the plan panel shows before it stops growing.
 const PLAN_PANEL_ROWS: usize = 6;
 
+/// What a keypress leaves the session doing.
+///
+/// Quitting comes in two kinds because only one of them is allowed to move the
+/// shell: `q` leaves it where it was, `Q` takes it along.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    Stay,
+    Quit,
+    /// Quit, and hand back the directory the session ended in.
+    QuitHere,
+}
+
 /// What the keyboard currently means.
 pub enum Mode {
     Normal,
@@ -63,6 +75,7 @@ const HELP: &[HelpSection] = &[
             ("/", "search the listing"),
             ("n / N", "next, previous match"),
             ("q", "quit"),
+            ("Q", "quit, and take the shell here"),
         ],
     },
     HelpSection {
@@ -170,34 +183,39 @@ impl Navigator {
         })
     }
 
+    /// The directory being viewed, which is where a session ends up.
+    pub fn current_dir(&self) -> &Path {
+        &self.current_dir
+    }
+
     /// Handles one keypress. Returns `true` when the navigator should quit.
     ///
     /// Nothing a key does is worth ending the session over: a directory that
     /// cannot be read, a neovim that is not installed, a listing that cannot be
     /// re-read — each is a line on the status bar, and the navigator stays where
     /// it is with its marks and its plan intact.
-    pub fn handle_key(&mut self, key: KeyEvent) -> bool {
+    pub fn handle_key(&mut self, key: KeyEvent) -> Outcome {
         let outcome = match self.mode {
             Mode::Prompt(_) => {
                 self.handle_prompt_key(key);
-                Ok(false)
+                Ok(Outcome::Stay)
             }
             Mode::Review => self.handle_review_key(key),
             Mode::Normal => self.handle_normal_key(key),
             Mode::Help => {
                 // Anything at all dismisses it: nobody should have to guess twice.
                 self.mode = Mode::Normal;
-                Ok(false)
+                Ok(Outcome::Stay)
             }
         };
 
         outcome.unwrap_or_else(|e| {
             log::error!("{e}");
-            false
+            Outcome::Stay
         })
     }
 
-    fn handle_normal_key(&mut self, key: KeyEvent) -> Resultx<bool> {
+    fn handle_normal_key(&mut self, key: KeyEvent) -> Resultx<Outcome> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
         match key.code {
@@ -209,7 +227,11 @@ impl Navigator {
             KeyCode::Char(_) if held(key) => {}
             KeyCode::Char('q') => {
                 log::info!("Navigator quit");
-                return Ok(true);
+                return Ok(Outcome::Quit);
+            }
+            KeyCode::Char('Q') => {
+                log::info!("Navigator quit in {}", self.current_dir.display());
+                return Ok(Outcome::QuitHere);
             }
             KeyCode::Char('j') | KeyCode::Down => self.move_down(),
             KeyCode::Char('k') | KeyCode::Up => self.move_up(),
@@ -245,12 +267,13 @@ impl Navigator {
             KeyCode::Char('?') => self.mode = Mode::Help,
             _ => {}
         }
-        Ok(false)
+        Ok(Outcome::Stay)
     }
 
-    fn handle_review_key(&mut self, key: KeyEvent) -> Resultx<bool> {
+    fn handle_review_key(&mut self, key: KeyEvent) -> Resultx<Outcome> {
         match key.code {
-            KeyCode::Char('q') => return Ok(true),
+            KeyCode::Char('q') => return Ok(Outcome::Quit),
+            KeyCode::Char('Q') => return Ok(Outcome::QuitHere),
             KeyCode::Esc | KeyCode::Char('p') => self.mode = Mode::Normal,
             KeyCode::Char('j') | KeyCode::Down => {
                 self.review_selected = (self.review_selected + 1).min(self.plan.len().max(1) - 1);
@@ -270,7 +293,7 @@ impl Navigator {
             KeyCode::Enter => self.apply_plan()?,
             _ => {}
         }
-        Ok(false)
+        Ok(Outcome::Stay)
     }
 
     fn handle_prompt_key(&mut self, key: KeyEvent) {
@@ -353,17 +376,21 @@ impl Navigator {
         }
     }
 
-    /// Returns `Ok(true)` if the navigator should quit (file opened in neovim).
-    pub fn enter_selected(&mut self) -> Resultx<bool> {
+    /// Quits when the file was handed to neovim: nav has done its job.
+    ///
+    /// That quit never moves the shell — only `Q` does — so opening a file from
+    /// somewhere you were only passing through leaves the shell where it was.
+    pub fn enter_selected(&mut self) -> Resultx<Outcome> {
         if self.entries.is_empty() {
-            return Ok(false);
+            return Ok(Outcome::Stay);
         }
 
         let entry = &self.entries[self.selected];
         let name = entry.name.clone();
 
         if !entry.is_dir {
-            return nvim::open(&self.current_dir.join(&name));
+            let opened = nvim::open(&self.current_dir.join(&name))?;
+            return Ok(if opened { Outcome::Quit } else { Outcome::Stay });
         }
 
         match name.as_str() {
@@ -378,7 +405,7 @@ impl Navigator {
                 self.go_to(new_path)?;
             }
         }
-        Ok(false)
+        Ok(Outcome::Stay)
     }
 
     /// Goes up one level. At the filesystem root there is nowhere to go, so this does nothing.
@@ -977,7 +1004,6 @@ impl Navigator {
                     Style::new().fg(ACCENT),
                 ),
                 Span::styled(if marked { MARK_DOT } else { " " }, Style::new().fg(MARK)),
-                Span::raw(" "),
                 Span::styled(icon_for(entry), Style::new().fg(color)),
                 Span::raw(" "),
             ];
@@ -1658,6 +1684,53 @@ mod tests {
         nav.go_to(tmp.path().join("sub")).unwrap();
 
         assert_eq!(selected(&nav), ".");
+    }
+
+    #[test]
+    fn q_quits_and_leaves_the_shell_where_it_was() {
+        let tmp = TempDir::new();
+        let mut nav = open(tmp.path(), None);
+
+        let outcome = nav.handle_key(KeyEvent::from(KeyCode::Char('q')));
+
+        assert_eq!(outcome, Outcome::Quit);
+    }
+
+    #[test]
+    fn shift_q_quits_and_takes_the_shell_along() {
+        let tmp = TempDir::new();
+        tmp.dir("sub");
+
+        let mut nav = open(tmp.path(), Some("sub"));
+        key(&mut nav, KeyCode::Enter);
+        let outcome = nav.handle_key(KeyEvent::from(KeyCode::Char('Q')));
+
+        assert_eq!(outcome, Outcome::QuitHere);
+        assert_eq!(
+            nav.current_dir(),
+            tmp.path().join("sub"),
+            "the directory handed over is the one the session ended in"
+        );
+    }
+
+    #[test]
+    fn both_quits_work_from_the_review_screen_too() {
+        let tmp = TempDir::new();
+        tmp.file("x.txt", "");
+
+        let mut nav = open(tmp.path(), Some("x.txt"));
+        press(&mut nav, 'd');
+        press(&mut nav, 'p');
+
+        assert!(matches!(nav.mode, Mode::Review));
+        assert_eq!(
+            nav.handle_key(KeyEvent::from(KeyCode::Char('q'))),
+            Outcome::Quit
+        );
+        assert_eq!(
+            nav.handle_key(KeyEvent::from(KeyCode::Char('Q'))),
+            Outcome::QuitHere
+        );
     }
 
     fn press(nav: &mut Navigator, c: char) {
@@ -2738,11 +2811,15 @@ mod tests {
         let mut nav = open(tmp.path(), Some("marked.txt"));
         press(&mut nav, ' ');
         nav.selected = index_of(&nav.entries, "locked").unwrap();
-        let quit = nav.handle_key(KeyEvent::from(KeyCode::Enter));
+        let outcome = nav.handle_key(KeyEvent::from(KeyCode::Enter));
 
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        assert!(!quit, "a directory you cannot read is not a reason to quit");
+        assert_eq!(
+            outcome,
+            Outcome::Stay,
+            "a directory you cannot read is not a reason to quit"
+        );
         assert_eq!(nav.current_dir, tmp.path(), "and it stays where it was");
         assert_eq!(nav.marks.len(), 1, "with the session's work intact");
     }
