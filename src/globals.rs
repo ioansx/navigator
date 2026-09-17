@@ -54,12 +54,9 @@ pub fn file_color(name: &str, is_dir: bool) -> Color {
         "mp3" | "flac" | "wav" | "ogg" | "m4a" | "aac" | "wma" => Color::LightRed,
         // Documents
         "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "odt" => Color::Yellow,
-        // Code
-        "rs" | "go" | "py" | "js" | "ts" | "jsx" | "tsx" | "c" | "cpp" | "h" | "hpp" | "java"
-        | "rb" | "sh" | "bash" | "zsh" | "lua" | "vim" | "ex" | "exs" => Color::Green,
-        // Config and data
-        "json" | "yaml" | "yml" | "toml" | "xml" | "html" | "css" | "scss" => Color::Cyan,
-        // Anything else keeps the terminal's default foreground.
+        // Anything you would open in an editor keeps the terminal's default
+        // foreground: a source tree is mostly that, and a listing where every row
+        // is tinted has no color left to mean anything.
         _ => Color::Reset,
     }
 }
@@ -82,6 +79,8 @@ mod tests {
     fn ordinary_files_keep_the_terminal_foreground() {
         assert_eq!(file_color("notes.txt", false), Color::Reset);
         assert_eq!(file_color("Makefile", false), Color::Reset);
+        assert_eq!(file_color("main.rs", false), Color::Reset);
+        assert_eq!(file_color("Cargo.toml", false), Color::Reset);
     }
 
     #[test]
@@ -134,7 +133,7 @@ mod tests {
 
     #[test]
     fn extensions_are_matched_case_insensitively() {
-        assert_eq!(file_color("MAIN.RS", false), Color::Green);
+        assert_eq!(file_color("BACKUP.ZIP", false), Color::Red);
         assert_eq!(file_color("Photo.PNG", false), Color::Magenta);
     }
 
@@ -154,6 +153,6 @@ mod tests {
     #[test]
     fn only_the_last_extension_colors_the_file() {
         assert_eq!(file_color("archive.tar.gz", false), Color::Red);
-        assert_eq!(file_color("component.spec.ts", false), Color::Green);
+        assert_eq!(file_color("photo.zip.png", false), Color::Magenta);
     }
 }
