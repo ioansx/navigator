@@ -39,8 +39,10 @@ fn edit_expr(path: &Path) -> String {
     // Doubling is how a single quote is escaped inside a Vimscript literal string,
     // and `fnameescape` handles the spaces and the `|`, `%`, `#` that `:edit` would
     // otherwise read as syntax.
+    // `keepalt` leaves `#` on the buffer the window showed before the terminal; a
+    // plain `:edit` would make it the terminal, which is deleted once `nav` exits.
     let quoted = path.to_string_lossy().replace('\'', "''");
-    format!("execute('edit ' . fnameescape('{quoted}'))")
+    format!("execute('keepalt edit ' . fnameescape('{quoted}'))")
 }
 
 #[cfg(test)]
@@ -53,10 +55,13 @@ mod tests {
     }
 
     #[test]
-    fn edits_the_path_in_the_current_window() {
+    fn edits_the_path_in_the_current_window_keeping_the_alternate_file() {
         let expr = expr_for("/home/me/main.rs");
 
-        assert_eq!(expr, "execute('edit ' . fnameescape('/home/me/main.rs'))");
+        assert_eq!(
+            expr,
+            "execute('keepalt edit ' . fnameescape('/home/me/main.rs'))"
+        );
     }
 
     #[test]
@@ -75,7 +80,10 @@ mod tests {
     fn doubles_single_quotes_so_they_do_not_end_the_string() {
         let expr = expr_for("/tmp/it's here.rs");
 
-        assert_eq!(expr, "execute('edit ' . fnameescape('/tmp/it''s here.rs'))");
+        assert_eq!(
+            expr,
+            "execute('keepalt edit ' . fnameescape('/tmp/it''s here.rs'))"
+        );
     }
 
     #[test]
