@@ -1,4 +1,4 @@
-//! Putting a file's contents on the system clipboard with OSC 52.
+//! Putting text, or a file's contents, on the system clipboard with OSC 52.
 //!
 //! The terminal emulator does the work, so this reaches the real clipboard even
 //! when `nav` is running on the far side of an SSH connection.
@@ -37,15 +37,23 @@ pub fn copy_file(path: &Path) -> Resultx<usize> {
         return Err(Errx::any(format!("{} is not a text file", name_of(path))));
     }
 
+    copy(&contents)?;
+    Ok(contents.len())
+}
+
+/// Copies `text` to the system clipboard.
+pub fn copy_text(text: &str) -> Resultx<()> {
+    copy(text.as_bytes())
+}
+
+fn copy(data: &[u8]) -> Resultx<()> {
     // Written straight to the terminal rather than through ratatui: this is a
     // control sequence, not something to draw, and it must not land mid-frame.
     let mut stdout = std::io::stdout();
     stdout
-        .write_all(osc52(&contents, std::env::var_os("TMUX").is_some()).as_bytes())
+        .write_all(osc52(data, std::env::var_os("TMUX").is_some()).as_bytes())
         .and_then(|()| stdout.flush())
-        .map_err(|e| Errx::e_io(e, "writing to the terminal"))?;
-
-    Ok(contents.len())
+        .map_err(|e| Errx::e_io(e, "writing to the terminal"))
 }
 
 fn name_of(path: &Path) -> String {

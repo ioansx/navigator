@@ -54,6 +54,8 @@ pub enum Mode {
     Prompt(Prompt),
     /// Reading the key map.
     Help,
+    /// `y` was pressed; the next key says what of the entry to copy.
+    Yank,
 }
 
 struct HelpSection {
@@ -110,7 +112,10 @@ const HELP: &[HelpSection] = &[
     HelpSection {
         title: "and also",
         keys: &[
-            ("y", "contents to the clipboard"),
+            ("yy", "copy contents"),
+            ("ya", "copy absolute path"),
+            ("yr", "copy path relative to the cwd"),
+            ("yf", "copy file name"),
             ("L", "show the log"),
             ("?", "these keys"),
         ],
@@ -153,6 +158,9 @@ pub struct Navigator {
     review_selected: usize,
     /// The last thing searched for, which `n` and `N` repeat.
     search: String,
+    /// The working directory `nav` started in, which `yr` copies paths relative
+    /// to. Inside a neovim terminal that is neovim's own, so `yr` agrees with `%:.`.
+    cwd: Option<PathBuf>,
 }
 
 impl Navigator {
@@ -180,6 +188,7 @@ impl Navigator {
             mode: Mode::Normal,
             review_selected: 0,
             search: String::new(),
+            cwd: dir::resolve(Path::new(".")).ok(),
         })
     }
 
@@ -205,6 +214,11 @@ impl Navigator {
             Mode::Help => {
                 // Anything at all dismisses it: nobody should have to guess twice.
                 self.mode = Mode::Normal;
+                Ok(Outcome::Stay)
+            }
+            Mode::Yank => {
+                self.mode = Mode::Normal;
+                self.yank(key);
                 Ok(Outcome::Stay)
             }
         };
@@ -262,7 +276,7 @@ impl Navigator {
             KeyCode::Char('a') => self.begin_prompt("new file", PromptAction::CreateFile),
             KeyCode::Char('A') => self.begin_prompt("new directory", PromptAction::CreateDir),
             KeyCode::Char('r') => self.begin_rename(),
-            KeyCode::Char('y') => self.yank_to_clipboard(),
+            KeyCode::Char('y') => self.mode = Mode::Yank,
             KeyCode::Char('p') => self.open_review(),
             KeyCode::Char('?') => self.mode = Mode::Help,
             _ => {}
@@ -696,15 +710,48 @@ impl Navigator {
         Ok(())
     }
 
-    fn yank_to_clipboard(&self) {
+    /// Copies what the key after `y` asks for: the entry's contents, or one of the
+    /// ways of spelling its path. Any other key just cancels the `y`.
+    fn yank(&self, key: KeyEvent) {
         let Some(path) = self.cursor_path() else {
             return;
         };
+        let KeyCode::Char(c) = key.code else {
+            return;
+        };
+        if held(key) {
+            return;
+        }
 
-        match clipboard::copy_file(&path) {
-            Ok(bytes) => log::info!("Copied {bytes} bytes to the clipboard"),
+        let copied = if c == 'y' {
+            clipboard::copy_file(&path).map(|bytes| format!("{bytes} bytes"))
+        } else if let Some(text) = self.spell_path(&path, c) {
+            clipboard::copy_text(&text).map(|()| text)
+        } else {
+            return;
+        };
+
+        match copied {
+            Ok(what) => log::info!("Copied {what} to the clipboard"),
             Err(e) => log::warn!("{e}"),
         }
+    }
+
+    /// `path` the way `ya`, `yr` or `yf` copies it.
+    fn spell_path(&self, path: &Path, c: char) -> Option<String> {
+        let spelled = match c {
+            'a' => path,
+            // Outside the cwd there is no relative path worth having, so it stays
+            // absolute, as `%:.` does. The cwd itself is `.`, not an empty string.
+            'r' => match self.cwd.as_deref().map(|cwd| path.strip_prefix(cwd)) {
+                Some(Ok(rest)) if rest.as_os_str().is_empty() => Path::new("."),
+                Some(Ok(rest)) => rest,
+                _ => path,
+            },
+            'f' => Path::new(path.file_name()?),
+            _ => return None,
+        };
+        Some(spelled.to_string_lossy().into_owned())
     }
 
     /// Re-reads the current directory, keeping the cursor on the same entry when
@@ -829,6 +876,7 @@ impl Navigator {
 
         match &self.mode {
             Mode::Prompt(prompt) => render_prompt(prompt, chunks[2], buf),
+            Mode::Yank => render_yank_choices(chunks[2], buf),
             _ => self.render_status_line(chunks[2], buf),
         }
     }
@@ -1250,6 +1298,30 @@ fn render_prompt(prompt: &Prompt, area: Rect, buf: &mut Buffer) {
         Span::styled("▏", Style::new().fg(ACCENT)),
     ])
     .render(inner, buf);
+}
+
+/// What can follow `y`, shown while it waits so nobody needs `?` to finish one.
+fn render_yank_choices(area: Rect, buf: &mut Buffer) {
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(Style::new().fg(DIM));
+    let inner = block.inner(area);
+    block.render(area, buf);
+
+    let mut spans = vec![Span::styled("copy", Style::new().fg(DIM))];
+    for (key, what) in [
+        ("y", "contents"),
+        ("a", "absolute"),
+        ("r", "relative"),
+        ("f", "name"),
+    ] {
+        spans.push(Span::styled(
+            format!("  {key} "),
+            Style::new().fg(ACCENT).bold(),
+        ));
+        spans.push(Span::raw(what));
+    }
+    Line::from(spans).render(inner, buf);
 }
 
 /// The directory being viewed, with `$HOME` shortened and everything above the
@@ -2921,6 +2993,69 @@ mod tests {
             out.contains("file11.txt"),
             "half the screen is blank in:\n{out}"
         );
+    }
+
+    #[test]
+    fn y_spells_a_path_absolute_relative_or_by_name() {
+        let tmp = TempDir::new();
+        let main = tmp.file("src/main.rs", "");
+
+        let mut nav = open(&tmp.path().join("src"), Some("main.rs"));
+        nav.cwd = Some(dir::resolve(tmp.path()).unwrap());
+        let main = dir::resolve(&main).unwrap();
+
+        assert_eq!(nav.spell_path(&main, 'a').unwrap(), main.to_str().unwrap());
+        assert_eq!(nav.spell_path(&main, 'r').unwrap(), "src/main.rs");
+        assert_eq!(nav.spell_path(&main, 'f').unwrap(), "main.rs");
+        assert_eq!(nav.spell_path(&main, 'x'), None);
+    }
+
+    #[test]
+    fn a_relative_path_outside_the_cwd_stays_absolute() {
+        let tmp = TempDir::new();
+        let a = tmp.file("a.txt", "");
+
+        let mut nav = open(tmp.path(), Some("a.txt"));
+        nav.cwd = Some(PathBuf::from("/somewhere/else"));
+        let a = dir::resolve(&a).unwrap();
+
+        assert_eq!(nav.spell_path(&a, 'r').unwrap(), a.to_str().unwrap());
+    }
+
+    #[test]
+    fn the_cwd_relative_to_itself_is_a_dot() {
+        let tmp = TempDir::new();
+        let root = dir::resolve(tmp.path()).unwrap();
+
+        let mut nav = open(tmp.path(), None);
+        nav.cwd = Some(root.clone());
+
+        assert_eq!(nav.spell_path(&root, 'r').unwrap(), ".");
+    }
+
+    #[test]
+    fn y_waits_for_a_second_key_and_shows_what_it_can_be() {
+        let tmp = TempDir::new();
+        tmp.file("a.txt", "");
+
+        let mut nav = open(tmp.path(), Some("a.txt"));
+        press(&mut nav, 'y');
+        let out = render_to_string(&mut nav, 80, 12);
+
+        assert!(matches!(nav.mode, Mode::Yank));
+        assert!(out.contains("a absolute"), "in:\n{out}");
+    }
+
+    #[test]
+    fn a_key_that_means_nothing_after_y_cancels_it() {
+        let tmp = TempDir::new();
+        tmp.file("a.txt", "");
+
+        let mut nav = open(tmp.path(), Some("a.txt"));
+        press(&mut nav, 'y');
+        key(&mut nav, KeyCode::Esc);
+
+        assert!(matches!(nav.mode, Mode::Normal));
     }
 
     #[test]
